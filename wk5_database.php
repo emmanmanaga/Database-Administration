@@ -1,11 +1,11 @@
 <?php
 session_start();
 
-$host     = '10.102.249.250';
+$host     = 'localhost';
 $port     = '5432';
 $dbname   = 'postgres';      
 $user     = 'postgres';      
-$password = 'maura';         
+$password = 'woshidaxuesheng';         
 
 try {
     $pdo = new PDO("pgsql:host=$host;port=$port;dbname=$dbname", $user, $password);

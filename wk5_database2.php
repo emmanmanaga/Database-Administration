@@ -1,29 +1,192 @@
 <?php
 session_start();
 
-$host     = '10.102.249.250';   // Remote PostgreSQL server (separate physical PC)
+$host     = 'localhost';
 $port     = '5432';
-$dbname   = 'postgres';      
-$user     = 'postgres';      
-$password = 'maura';         
+$dbname   = 'postgres';
+$user     = 'postgres';
+$password = 'woshidaxuesheng';
 
 try {
+    if ($password === '') {
+        throw new RuntimeException('The DB_PASSWORD environment variable is not configured.');
+    }
     $pdo = new PDO("pgsql:host=$host;port=$port;dbname=$dbname;connect_timeout=5", $user, $password);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch (PDOException $e) {
-    die('Database connection failed: ' . $e->getMessage());
+    $connection_info = $pdo->query("
+        SELECT current_database() AS database_name,
+               current_setting('server_version') AS server_version
+    ")->fetch(PDO::FETCH_ASSOC);
+} catch (Throwable $e) {
+    error_log('PostgreSQL connection failed: ' . $e->getMessage());
+    http_response_code(503);
+    ?>
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Database Connection Status | University Property Borrowing System</title>
+        <link rel="stylesheet" href="wk5_database2.css">
+    </head>
+    <body class="connection-error">
+        <main class="connection-status">
+            <h1>University Property Borrowing System</h1>
+            <h2>Database connection</h2>
+            <p class="connection-error-status" role="status">Unable to connect to PostgreSQL. The borrowing system is temporarily unavailable.</p>
+            <dl>
+                <dt>Configured host</dt>
+                <dd><?= htmlspecialchars($host, ENT_QUOTES, 'UTF-8') ?></dd>
+                <dt>Port</dt>
+                <dd><?= htmlspecialchars($port, ENT_QUOTES, 'UTF-8') ?></dd>
+                <dt>Database</dt>
+                <dd><?= htmlspecialchars($dbname, ENT_QUOTES, 'UTF-8') ?></dd>
+            </dl>
+            <p>Check that PostgreSQL is running and that its connection settings and network access rules allow this XAMPP server to connect.</p>
+        </main>
+    </body>
+    </html>
+    <?php
+    exit;
 }
 
-// Helper for flash messages
-function setFlash($msg, $type = 'success') {
-    $_SESSION['flash'] = ['msg' => $msg, 'type' => $type];
+$is_local_database = in_array(strtolower(trim($host)), ['localhost', '127.0.0.1', '::1'], true);
+
+function redirectWithFlash(string $message, string $type = 'success'): void {
+    $_SESSION['flash'] = ['msg' => $message, 'type' => $type];
+    header('Location: ' . ($_SERVER['PHP_SELF'] ?? '/'));
+    exit;
 }
 
-// Translate raw PostgreSQL errors into readable, user-friendly messages
-function friendlyError(Throwable $e) {
+function postText(string $key, string $label, int $maxLength): string {
+    $value = $_POST[$key] ?? null;
+    if (!is_string($value)) {
+        throw new InvalidArgumentException("$label is required.");
+    }
+    $value = trim($value);
+    if ($value === '') {
+        throw new InvalidArgumentException("$label is required.");
+    }
+    if (!mb_check_encoding($value, 'UTF-8')) {
+        throw new InvalidArgumentException("$label contains invalid text.");
+    }
+    if (mb_strlen($value, 'UTF-8') > $maxLength) {
+        throw new InvalidArgumentException("$label must not exceed $maxLength characters.");
+    }
+    return $value;
+}
+
+function postPositiveInt(string $key, string $label): int {
+    $rawValue = $_POST[$key] ?? null;
+    if (!is_string($rawValue) && !is_int($rawValue)) {
+        throw new InvalidArgumentException("$label must be a positive whole number.");
+    }
+    $value = filter_var($rawValue, FILTER_VALIDATE_INT);
+    if ($value === false || $value === null || $value < 1) {
+        throw new InvalidArgumentException("$label must be a positive whole number.");
+    }
+    return $value;
+}
+
+function postNonNegativeInt(string $key, string $label): int {
+    $rawValue = $_POST[$key] ?? null;
+    if (!is_string($rawValue) && !is_int($rawValue)) {
+        throw new InvalidArgumentException("$label must be a whole number of zero or more.");
+    }
+    $value = filter_var($rawValue, FILTER_VALIDATE_INT);
+    if ($value === false || $value === null || $value < 0) {
+        throw new InvalidArgumentException("$label must be a whole number of zero or more.");
+    }
+    return $value;
+}
+
+function postDate(string $key, string $label): string {
+    $value = $_POST[$key] ?? null;
+    if (!validDate($value)) {
+        throw new InvalidArgumentException("$label must be a valid date.");
+    }
+    return $value;
+}
+
+function validDate(mixed $value): bool {
+    if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}$/D', $value)) {
+        return false;
+    }
+    $date = DateTimeImmutable::createFromFormat('!Y-m-d', $value);
+    $errors = DateTimeImmutable::getLastErrors();
+    return $date
+        && ($errors === false || ($errors['warning_count'] === 0 && $errors['error_count'] === 0))
+        && $date->format('Y-m-d') === $value;
+}
+
+function postBorrowerType(): string {
+    $value = postText('borrower_type', 'Borrower type', 20);
+    $type = ucfirst(strtolower($value));
+    if (!in_array($type, ['Student', 'Faculty', 'Staff'], true)) {
+        throw new InvalidArgumentException('Choose Student, Faculty, or Staff as the borrower type.');
+    }
+    return $type;
+}
+
+function postTransactionStatus(): string {
+    $value = postText('status', 'Transaction status', 20);
+    if (!in_array($value, ['Pending', 'Borrowed', 'Returned', 'Overdue'], true)) {
+        throw new InvalidArgumentException('Choose a valid transaction status.');
+    }
+    return $value;
+}
+
+function postBorrowItems(string $equipmentKey = 'equipment_id', string $quantityKey = 'quantity'): array {
+    $equipmentIds = $_POST[$equipmentKey] ?? null;
+    $quantities = $_POST[$quantityKey] ?? null;
+    if (!is_array($equipmentIds) || !is_array($quantities) || count($equipmentIds) < 1 || count($equipmentIds) !== count($quantities)) {
+        throw new InvalidArgumentException('Add at least one equipment item and specify its quantity.');
+    }
+
+    $items = [];
+    $seenEquipmentIds = [];
+    if (count($equipmentIds) > 50) {
+        throw new InvalidArgumentException('A transaction cannot contain more than 50 equipment items.');
+    }
+    foreach ($equipmentIds as $index => $rawEquipmentId) {
+        if ((!is_string($rawEquipmentId) && !is_int($rawEquipmentId))
+            || (!isset($quantities[$index]) || (!is_string($quantities[$index]) && !is_int($quantities[$index])))) {
+            throw new InvalidArgumentException('Choose valid equipment and enter a quantity of at least one for every item.');
+        }
+        $equipmentId = filter_var($rawEquipmentId, FILTER_VALIDATE_INT);
+        $quantity = filter_var($quantities[$index] ?? null, FILTER_VALIDATE_INT);
+        if ($equipmentId === false || $equipmentId === null || $equipmentId < 1 || $quantity === false || $quantity === null || $quantity < 1) {
+            throw new InvalidArgumentException('Choose valid equipment and enter a quantity of at least one for every item.');
+        }
+        if (isset($seenEquipmentIds[$equipmentId])) {
+            throw new InvalidArgumentException('Each equipment type can only appear once per transaction. Combine duplicate rows into one quantity.');
+        }
+        $seenEquipmentIds[$equipmentId] = true;
+        $items[] = ['equipment_id' => $equipmentId, 'quantity' => $quantity];
+    }
+    return $items;
+}
+
+$request_method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$post_action = $request_method === 'POST' && is_string($_POST['action'] ?? null)
+    ? $_POST['action']
+    : '';
+
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+if ($request_method === 'POST') {
+    $submittedToken = $_POST['csrf_token'] ?? null;
+    if (!is_string($submittedToken) || !hash_equals($_SESSION['csrf_token'], $submittedToken)) {
+        redirectWithFlash('Your form session expired or was invalid. Please try again.', 'error');
+    }
+}
+
+function friendlyError(Throwable $e): string {
     $map = [
         '23505' => 'Duplicate value — that identifier already exists. Please use a unique one.',
-        '23503' => 'Invalid reference — the selected borrower or equipment does not exist.',
+        '23503' => 'This action conflicts with a related record. Check your selection, and remove dependent records before deleting.',
         '23514' => 'Invalid value — it breaks an allowed range or list rule.',
         '23502' => 'A required field was left empty.',
         '22P02' => 'Invalid input format.',
@@ -33,230 +196,293 @@ function friendlyError(Throwable $e) {
     if (isset($map[$code])) {
         return $map[$code];
     }
-    // Trigger RAISE EXCEPTION messages are already human-readable
-    if (preg_match('/ERROR:\s*(.+)$/s', $e->getMessage(), $m)) {
-        return trim($m[1]);
+    if ($e instanceof InvalidArgumentException) {
+        return $e->getMessage();
     }
-    return $e->getMessage();
+    if ($e instanceof PDOException) {
+        if ($code === 'P0001' && preg_match('/ERROR:\s*([^\r\n]+)/', $e->getMessage(), $m)) {
+            return trim($m[1]);
+        }
+        error_log('Borrowing system database operation failed: ' . $e->getMessage());
+        return 'The operation could not be completed. Please review the information and try again.';
+    }
+    if ($e instanceof RuntimeException) {
+        return $e->getMessage();
+    }
+    error_log('Borrowing system operation failed: ' . $e->getMessage());
+    return 'The operation could not be completed. Please review the information and try again.';
 }
 
-// CREATE BORROWER + TRANSACTION + ITEM
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'create') {
+// CREATE TRANSACTION WITH ONE OR MORE BORROW ITEMS
+if ($post_action === 'create_transaction') {
     try {
-        $pdo->beginTransaction();
-
-        $borrower_no   = trim($_POST['borrower_no'] ?? '');
-        $full_name     = trim($_POST['full_name'] ?? '');
-        $borrower_type = strtolower(trim($_POST['borrower_type'] ?? ''));
-
-        // Merge: reuse the borrower if the Borrower No. already exists
-        $stmtFind = $pdo->prepare('SELECT borrower_id FROM borrowers WHERE borrower_no = :borrower_no');
-        $stmtFind->execute([':borrower_no' => $borrower_no]);
-        $borrower_id = $stmtFind->fetchColumn();
-
-        if ($borrower_id) {
-            $stmtB = $pdo->prepare('UPDATE borrowers SET full_name = :full_name, borrower_type = :borrower_type WHERE borrower_id = :borrower_id');
-            $stmtB->execute([
-                ':full_name'     => $full_name,
-                ':borrower_type' => $borrower_type,
-                ':borrower_id'   => $borrower_id
-            ]);
-            $merged = true;
-        } else {
-            $stmtB = $pdo->prepare('INSERT INTO borrowers (borrower_no, full_name, borrower_type) VALUES (:borrower_no, :full_name, :borrower_type) RETURNING borrower_id');
-            $stmtB->execute([
-                ':borrower_no'   => $borrower_no,
-                ':full_name'     => $full_name,
-                ':borrower_type' => $borrower_type
-            ]);
-            $borrower_id = $stmtB->fetchColumn();
-            $merged = false;
+        $borrower_id = postPositiveInt('borrower_id', 'Borrower');
+        $borrow_date = postDate('borrow_date', 'Borrow date');
+        $due_date = postDate('due_date', 'Due date');
+        $status = postTransactionStatus();
+        $items = postBorrowItems();
+        if ($due_date < $borrow_date) {
+            throw new InvalidArgumentException('Due date cannot be earlier than the borrow date.');
         }
 
+        $pdo->beginTransaction();
         $stmtT = $pdo->prepare('INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status) VALUES (:borrower_id, :borrow_date, :due_date, :status) RETURNING borrow_id');
         $stmtT->execute([
             ':borrower_id' => $borrower_id,
-            ':borrow_date' => $_POST['borrow_date'],
-            ':due_date'    => $_POST['due_date'],
-            ':status'      => 'borrowed'
+            ':borrow_date' => $borrow_date,
+            ':due_date'    => $due_date,
+            ':status'      => $status,
         ]);
         $borrow_id = $stmtT->fetchColumn();
 
-        // Support one or more equipment items attached to the same transaction
-        $equip_ids = (array)($_POST['equipment_id'] ?? []);
-        $qtys      = (array)($_POST['quantity'] ?? []);
         $stmtI = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, :quantity)');
-        foreach ($equip_ids as $idx => $eid) {
-            if ($eid === '' || $eid === null) {
-                continue;
-            }
-            $qty = (int)($qtys[$idx] ?? 1);
-            if ($qty < 1) {
-                $qty = 1;
-            }
+        foreach ($items as $item) {
             $stmtI->execute([
                 ':borrow_id'    => $borrow_id,
-                ':equipment_id' => (int)$eid,
-                ':quantity'     => $qty
+                ':equipment_id' => $item['equipment_id'],
+                ':quantity'     => $item['quantity'],
             ]);
         }
 
         $pdo->commit();
-        setFlash($merged ? "New borrowing added for existing borrower!" : "Borrower and transaction added successfully!");
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        redirectWithFlash('Borrowing transaction and its equipment items created successfully.');
     } catch (Exception $e) {
-        $pdo->rollBack();
-        setFlash("Error creating record: " . friendlyError($e), 'error');
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        redirectWithFlash('Error creating record: ' . friendlyError($e), 'error');
     }
 }
 
-// REGISTER BORROWER ONLY (no checkout) — makes the "Borrowers Without Transactions" LEFT JOIN report demonstrable
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'create_borrower_only') {
+// CREATE BORROWER
+if ($post_action === 'create_borrower') {
     try {
+        $borrower_no = postText('borrower_no', 'Borrower number', 20);
+        $full_name = postText('full_name', 'Full name', 100);
+        $borrower_type = postBorrowerType();
         $stmt = $pdo->prepare('INSERT INTO borrowers (borrower_no, full_name, borrower_type) VALUES (:borrower_no, :full_name, :borrower_type)');
         $stmt->execute([
-            ':borrower_no'   => trim($_POST['borrower_no'] ?? ''),
-            ':full_name'     => trim($_POST['full_name'] ?? ''),
-            ':borrower_type' => strtolower(trim($_POST['borrower_type'] ?? '')),
+            ':borrower_no'   => $borrower_no,
+            ':full_name'     => $full_name,
+            ':borrower_type' => $borrower_type,
         ]);
-        setFlash('Borrower registered successfully (no borrowing yet).');
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        redirectWithFlash('Borrower registered successfully (no borrowing yet).');
     } catch (Exception $e) {
-        setFlash('Error registering borrower: ' . friendlyError($e), 'error');
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        redirectWithFlash('Error registering borrower: ' . friendlyError($e), 'error');
+    }
+}
+
+// UPDATE TRANSACTION AND RECONCILE ITS BORROW ITEMS
+if ($post_action === 'update_transaction') {
+    try {
+        $borrow_id = postPositiveInt('borrow_id', 'Transaction ID');
+        $borrower_id = postPositiveInt('borrower_id', 'Borrower');
+        $item_ids = $_POST['borrow_item_id'] ?? null;
+        $items = postBorrowItems();
+        $borrow_date = postDate('borrow_date', 'Borrow date');
+        $due_date = postDate('due_date', 'Due date');
+        $status = postTransactionStatus();
+        if ($due_date < $borrow_date) {
+            throw new InvalidArgumentException('Due date cannot be earlier than the borrow date.');
+        }
+        if (!is_array($item_ids) || count($item_ids) !== count($items)) {
+            throw new InvalidArgumentException('The transaction items are invalid. Reload the page and try again.');
+        }
+
+        $pdo->beginTransaction();
+        $stmtT = $pdo->prepare('UPDATE borrow_transactions SET borrower_id = :borrower_id, borrow_date = :borrow_date, due_date = :due_date, status = :status WHERE borrow_id = :borrow_id');
+        $stmtT->execute([
+            ':borrower_id' => $borrower_id,
+            ':borrow_date' => $borrow_date,
+            ':due_date' => $due_date,
+            ':status' => $status,
+            ':borrow_id' => $borrow_id,
+        ]);
+        if ($stmtT->rowCount() === 0) {
+            $stmtExists = $pdo->prepare('SELECT 1 FROM borrow_transactions WHERE borrow_id = :borrow_id');
+            $stmtExists->execute([':borrow_id' => $borrow_id]);
+            if (!$stmtExists->fetchColumn()) {
+                throw new RuntimeException('The selected borrowing transaction no longer exists.');
+            }
+        }
+
+        $stmtExisting = $pdo->prepare('SELECT borrow_item_id FROM borrow_items WHERE borrow_id = :borrow_id');
+        $stmtExisting->execute([':borrow_id' => $borrow_id]);
+        $remaining_item_ids = array_fill_keys(array_map('strval', $stmtExisting->fetchAll(PDO::FETCH_COLUMN)), true);
+        $stmtUpdateItem = $pdo->prepare('UPDATE borrow_items SET equipment_id = :equipment_id, quantity = :quantity WHERE borrow_item_id = :borrow_item_id AND borrow_id = :borrow_id');
+        $stmtInsertItem = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, :quantity)');
+
+        foreach ($items as $idx => $item) {
+            $raw_item_id = $item_ids[$idx] ?? null;
+            if (!is_string($raw_item_id) && !is_int($raw_item_id)) {
+                throw new InvalidArgumentException('The transaction items are invalid. Reload the page and try again.');
+            }
+            $raw_item_id = trim((string)$raw_item_id);
+            $item_id = $raw_item_id === '' ? '' : filter_var($raw_item_id, FILTER_VALIDATE_INT);
+            if ($item_id === false || ($item_id !== '' && $item_id < 1)) {
+                throw new InvalidArgumentException('The transaction items are invalid. Reload the page and try again.');
+            }
+            $item_id = (string)$item_id;
+            if ($item_id === '') {
+                $stmtInsertItem->execute([
+                    ':borrow_id' => $borrow_id,
+                    ':equipment_id' => $item['equipment_id'],
+                    ':quantity' => $item['quantity'],
+                ]);
+                continue;
+            }
+            if (!isset($remaining_item_ids[$item_id])) {
+                throw new InvalidArgumentException('An item in this transaction was changed or removed. Reload the page and try again.');
+            }
+            $stmtUpdateItem->execute([
+                ':equipment_id' => $item['equipment_id'],
+                ':quantity' => $item['quantity'],
+                ':borrow_item_id' => (int)$item_id,
+                ':borrow_id' => $borrow_id,
+            ]);
+            unset($remaining_item_ids[$item_id]);
+        }
+
+        if ($remaining_item_ids) {
+            $stmtDeleteItem = $pdo->prepare('DELETE FROM borrow_items WHERE borrow_item_id = :borrow_item_id AND borrow_id = :borrow_id');
+            foreach (array_keys($remaining_item_ids) as $item_id) {
+                $stmtDeleteItem->execute([
+                    ':borrow_item_id' => (int)$item_id,
+                    ':borrow_id' => $borrow_id,
+                ]);
+            }
+        }
+
+        $pdo->commit();
+        redirectWithFlash('Borrowing transaction and its equipment items updated successfully.');
+    } catch (Exception $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        redirectWithFlash('Error updating transaction: ' . friendlyError($e), 'error');
+    }
+}
+
+// DELETE A TRANSACTION AND ITS ITEMS
+if ($post_action === 'delete_transaction') {
+    try {
+        $borrow_id = postPositiveInt('borrow_id', 'Transaction ID');
+        $pdo->beginTransaction();
+        $stmtItems = $pdo->prepare('DELETE FROM borrow_items WHERE borrow_id = :borrow_id');
+        $stmtItems->execute([':borrow_id' => $borrow_id]);
+        $stmtTransaction = $pdo->prepare('DELETE FROM borrow_transactions WHERE borrow_id = :borrow_id');
+        $stmtTransaction->execute([':borrow_id' => $borrow_id]);
+        if ($stmtTransaction->rowCount() === 0) {
+            throw new RuntimeException('The selected borrowing transaction no longer exists.');
+        }
+        $pdo->commit();
+        redirectWithFlash('Borrowing transaction and its equipment items deleted successfully.');
+    } catch (Exception $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        redirectWithFlash('Error deleting transaction: ' . friendlyError($e), 'error');
     }
 }
 
 // EQUIPMENT CRUD OPERATIONS
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
+if ($request_method === 'POST') {
+    $action = $post_action;
     
     // Create Equipment
     if ($action === 'create_equipment') {
         try {
+            $property_no = postText('property_no', 'Property number', 20);
+            $equipment_name = postText('equipment_name', 'Equipment name', 100);
+            $quantity_available = postNonNegativeInt('quantity_available', 'Available quantity');
             $stmt = $pdo->prepare('INSERT INTO equipment (property_no, equipment_name, quantity_available) VALUES (:property_no, :equipment_name, :quantity_available)');
             $stmt->execute([
-                ':property_no'        => trim($_POST['property_no'] ?? ''),
-                ':equipment_name'     => trim($_POST['equipment_name'] ?? ''),
-                ':quantity_available' => (int)($_POST['quantity_available'] ?? 0)
+                ':property_no'        => $property_no,
+                ':equipment_name'     => $equipment_name,
+                ':quantity_available' => $quantity_available
             ]);
-            setFlash("Equipment added successfully!");
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            redirectWithFlash('Equipment added successfully!');
         } catch (Exception $e) {
-            setFlash("Error adding equipment: " . friendlyError($e), 'error');
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            redirectWithFlash('Error adding equipment: ' . friendlyError($e), 'error');
         }
     }
     
     // Update Equipment
     if ($action === 'update_equipment') {
         try {
+            $equipment_id = postPositiveInt('equipment_id', 'Equipment ID');
+            $property_no = postText('property_no', 'Property number', 20);
+            $equipment_name = postText('equipment_name', 'Equipment name', 100);
+            $quantity_available = postNonNegativeInt('quantity_available', 'Available quantity');
             $stmt = $pdo->prepare('UPDATE equipment SET property_no = :property_no, equipment_name = :equipment_name, quantity_available = :quantity_available WHERE equipment_id = :equipment_id');
             $stmt->execute([
-                ':property_no'        => trim($_POST['property_no'] ?? ''),
-                ':equipment_name'     => trim($_POST['equipment_name'] ?? ''),
-                ':quantity_available' => (int)($_POST['quantity_available'] ?? 0),
-                ':equipment_id'       => (int)$_POST['equipment_id']
+                ':property_no'        => $property_no,
+                ':equipment_name'     => $equipment_name,
+                ':quantity_available' => $quantity_available,
+                ':equipment_id'       => $equipment_id
             ]);
-            setFlash("Equipment updated successfully!");
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            if ($stmt->rowCount() === 0) {
+                $stmtExists = $pdo->prepare('SELECT 1 FROM equipment WHERE equipment_id = :equipment_id');
+                $stmtExists->execute([':equipment_id' => $equipment_id]);
+                if (!$stmtExists->fetchColumn()) {
+                    throw new RuntimeException('The selected equipment no longer exists.');
+                }
+            }
+            redirectWithFlash('Equipment updated successfully!');
         } catch (Exception $e) {
-            setFlash("Error updating equipment: " . friendlyError($e), 'error');
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            redirectWithFlash('Error updating equipment: ' . friendlyError($e), 'error');
         }
     }
     
     // Delete Equipment
     if ($action === 'delete_equipment') {
         try {
+            $equipment_id = postPositiveInt('equipment_id', 'Equipment ID');
             $stmt = $pdo->prepare('DELETE FROM equipment WHERE equipment_id = :equipment_id');
-            $stmt->execute([':equipment_id' => (int)$_POST['equipment_id']]);
-            setFlash("Equipment deleted successfully!");
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            $stmt->execute([':equipment_id' => $equipment_id]);
+            if ($stmt->rowCount() === 0) {
+                throw new RuntimeException('The selected equipment no longer exists.');
+            }
+            redirectWithFlash('Equipment deleted successfully!');
         } catch (Exception $e) {
-            setFlash("Error deleting equipment: " . friendlyError($e), 'error');
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            redirectWithFlash('Error deleting equipment: ' . friendlyError($e), 'error');
         }
     }
 }
 
-// UPDATE BORROWER & TRANSACTION
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'update') {
+// UPDATE BORROWER
+if ($post_action === 'update_borrower') {
     try {
-        $pdo->beginTransaction();
+        $borrower_id = postPositiveInt('borrower_id', 'Borrower ID');
+        $borrower_no = postText('borrower_no', 'Borrower number', 20);
+        $full_name = postText('full_name', 'Full name', 100);
+        $borrower_type = postBorrowerType();
 
-        $borrower_id = (int)($_POST['borrower_id'] ?? 0);
+        $stmtCheck = $pdo->prepare('SELECT 1 FROM borrowers WHERE borrower_id = :borrower_id');
+        $stmtCheck->execute([':borrower_id' => $borrower_id]);
+        if (!$stmtCheck->fetchColumn()) {
+            throw new RuntimeException('The selected borrower no longer exists.');
+        }
 
-        // 1. Update Borrower
         $stmtB = $pdo->prepare('UPDATE borrowers SET borrower_no = :borrower_no, full_name = :full_name, borrower_type = :borrower_type WHERE borrower_id = :borrower_id');
         $stmtB->execute([
-            ':borrower_no'   => trim($_POST['borrower_no'] ?? ''),
-            ':full_name'     => trim($_POST['full_name'] ?? ''),
-            ':borrower_type' => strtolower(trim($_POST['borrower_type'] ?? '')),
+            ':borrower_no'   => $borrower_no,
+            ':full_name'     => $full_name,
+            ':borrower_type' => $borrower_type,
             ':borrower_id'   => $borrower_id
         ]);
 
-        // Fetch existing borrow_id for this borrower (if available)
-        $stmtTFetch = $pdo->prepare('SELECT borrow_id FROM borrow_transactions WHERE borrower_id = :borrower_id ORDER BY borrow_id DESC LIMIT 1');
-        $stmtTFetch->execute([':borrower_id' => $borrower_id]);
-        $borrow_id = $stmtTFetch->fetchColumn();
-
-        if ($borrow_id) {
-            // 2. Update Transaction Dates
-            $stmtT = $pdo->prepare('UPDATE borrow_transactions SET borrow_date = :borrow_date, due_date = :due_date WHERE borrow_id = :borrow_id');
-            $stmtT->execute([
-                ':borrow_date' => $_POST['borrow_date'],
-                ':due_date'    => $_POST['due_date'],
-                ':borrow_id'   => $borrow_id
-            ]);
-
-            // 3. Update the first borrowed item of this transaction (safe for multi-item transactions)
-            $item_eid = $_POST['equipment_id'] ?? null;
-            if (is_array($item_eid)) {
-                $item_eid = reset($item_eid);
-            }
-            if (!empty($item_eid)) {
-                $item_qty = $_POST['quantity'] ?? 1;
-                if (is_array($item_qty)) {
-                    $item_qty = reset($item_qty);
-                }
-                $stmtI = $pdo->prepare('UPDATE borrow_items SET equipment_id = :equipment_id, quantity = :quantity WHERE borrow_item_id = (SELECT borrow_item_id FROM borrow_items WHERE borrow_id = :borrow_id ORDER BY borrow_item_id LIMIT 1)');
-                $stmtI->execute([
-                    ':equipment_id' => (int)$item_eid,
-                    ':quantity'     => (int)$item_qty,
-                    ':borrow_id'    => $borrow_id
-                ]);
-            }
-        }
-
-        $pdo->commit();
-        setFlash("Record updated successfully!");
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        redirectWithFlash('Borrower updated successfully.');
     } catch (Exception $e) {
-        $pdo->rollBack();
-        setFlash("Error updating record: " . friendlyError($e), 'error');
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        redirectWithFlash('Error updating borrower: ' . friendlyError($e), 'error');
     }
 }
 
 // DELETE BORROWER
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delete') {
+if ($post_action === 'delete') {
     try {
         $pdo->beginTransaction();
-        $borrower_id = (int)($_POST['borrower_id'] ?? 0);
+        $borrower_id = postPositiveInt('borrower_id', 'Borrower ID');
         
         $stmtT = $pdo->prepare('SELECT borrow_id FROM borrow_transactions WHERE borrower_id = :id');
         $stmtT->execute([':id' => $borrower_id]);
@@ -267,17 +493,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delet
             $pdo->prepare('DELETE FROM borrow_transactions WHERE borrow_id = :bid')->execute([':bid' => $bid]);
         }
         
-        $pdo->prepare('DELETE FROM borrowers WHERE borrower_id = :id')->execute([':id' => $borrower_id]);
+        $stmtBorrower = $pdo->prepare('DELETE FROM borrowers WHERE borrower_id = :id');
+        $stmtBorrower->execute([':id' => $borrower_id]);
+        if ($stmtBorrower->rowCount() === 0) {
+            throw new RuntimeException('The selected borrower no longer exists.');
+        }
         
         $pdo->commit();
-        setFlash("Borrower deleted successfully!");
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        redirectWithFlash('Borrower deleted successfully!');
     } catch (Exception $e) {
-        $pdo->rollBack();
-        setFlash("Error deleting borrower: " . friendlyError($e), 'error');
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit;
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        redirectWithFlash('Error deleting borrower: ' . friendlyError($e), 'error');
     }
 }
 
@@ -307,7 +535,7 @@ try {
             e.equipment_id,
             e.property_no,
             e.equipment_name,
-            COUNT(bi.borrow_id) AS total_transactions,
+            COUNT(DISTINCT bi.borrow_id) AS total_transactions,
             SUM(COALESCE(bi.quantity, 0)) AS total_quantity_borrowed,
             CASE 
                 WHEN e.quantity_available > 5 THEN 'Available'
@@ -319,7 +547,7 @@ try {
         GROUP BY e.equipment_id, e.property_no, e.equipment_name
     ");
 } catch (Exception $e) {
-    // Silently fail if permissions don't allow view creation
+    error_log('Borrowing system view setup failed: ' . $e->getMessage());
 }
 
 // WEEK 10 POSTGRESQL DATABASE OBJECTS (Functions, Triggers, Audit)
@@ -340,6 +568,9 @@ try {
             v_available_qty INT;
         BEGIN
             SELECT quantity_available INTO v_available_qty FROM equipment WHERE equipment_id = p_equipment_id;
+            IF NOT FOUND OR p_requested_qty IS NULL OR p_requested_qty <= 0 THEN
+                RETURN FALSE;
+            END IF;
             IF v_available_qty >= p_requested_qty THEN
                 RETURN TRUE;
             ELSE
@@ -356,13 +587,18 @@ try {
         DECLARE
             v_available_qty INT;
             v_already_held  INT := 0;
+            v_status VARCHAR(20);
         BEGIN
-            SELECT quantity_available INTO v_available_qty FROM equipment WHERE equipment_id = NEW.equipment_id;
-            -- When editing, the quantity this same item already holds counts back as available
+            SELECT e.quantity_available, bt.status
+            INTO v_available_qty, v_status
+            FROM equipment e
+            JOIN borrow_transactions bt ON bt.borrow_id = NEW.borrow_id
+            WHERE e.equipment_id = NEW.equipment_id;
             IF (TG_OP = 'UPDATE' AND OLD.equipment_id = NEW.equipment_id) THEN
                 v_already_held := OLD.quantity;
             END IF;
-            IF NEW.quantity > v_available_qty + v_already_held THEN
+            IF v_status IN ('Borrowed', 'Overdue')
+               AND NEW.quantity > v_available_qty + v_already_held THEN
                 RAISE EXCEPTION 'Requested quantity (%) exceeds available stock (%)', NEW.quantity, v_available_qty + v_already_held;
             END IF;
             RETURN NEW;
@@ -418,14 +654,32 @@ try {
     $pdo->exec("
         CREATE OR REPLACE FUNCTION fn_sync_equipment_stock()
         RETURNS TRIGGER AS $$
+        DECLARE
+            v_status VARCHAR(20);
+            v_old_active BOOLEAN := FALSE;
+            v_new_active BOOLEAN := FALSE;
         BEGIN
             IF (TG_OP = 'INSERT') THEN
-                UPDATE equipment SET quantity_available = quantity_available - NEW.quantity WHERE equipment_id = NEW.equipment_id;
+                SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = NEW.borrow_id;
+                IF v_status IN ('Borrowed', 'Overdue') THEN
+                    UPDATE equipment SET quantity_available = quantity_available - NEW.quantity WHERE equipment_id = NEW.equipment_id;
+                END IF;
             ELSIF (TG_OP = 'DELETE') THEN
-                UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
+                SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = OLD.borrow_id;
+                IF v_status IN ('Borrowed', 'Overdue') THEN
+                    UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
+                END IF;
             ELSIF (TG_OP = 'UPDATE') THEN
-                UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
-                UPDATE equipment SET quantity_available = quantity_available - NEW.quantity WHERE equipment_id = NEW.equipment_id;
+                SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = OLD.borrow_id;
+                v_old_active := v_status IN ('Borrowed', 'Overdue');
+                SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = NEW.borrow_id;
+                v_new_active := v_status IN ('Borrowed', 'Overdue');
+                IF v_old_active THEN
+                    UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
+                END IF;
+                IF v_new_active THEN
+                    UPDATE equipment SET quantity_available = quantity_available - NEW.quantity WHERE equipment_id = NEW.equipment_id;
+                END IF;
             END IF;
             RETURN NULL;
         END;
@@ -435,13 +689,86 @@ try {
         CREATE TRIGGER trg_sync_equipment_stock
         AFTER INSERT OR UPDATE OR DELETE ON borrow_items
         FOR EACH ROW EXECUTE FUNCTION fn_sync_equipment_stock();
+
+        CREATE OR REPLACE FUNCTION fn_sync_equipment_stock_on_status_change()
+        RETURNS TRIGGER AS $$
+        DECLARE
+            v_item RECORD;
+        BEGIN
+            IF OLD.status IN ('Borrowed', 'Overdue')
+               AND NEW.status NOT IN ('Borrowed', 'Overdue') THEN
+                FOR v_item IN
+                    SELECT equipment_id, SUM(quantity)::INT AS quantity
+                    FROM borrow_items
+                    WHERE borrow_id = NEW.borrow_id
+                    GROUP BY equipment_id
+                    ORDER BY equipment_id
+                LOOP
+                    UPDATE equipment
+                    SET quantity_available = quantity_available + v_item.quantity
+                    WHERE equipment_id = v_item.equipment_id;
+                END LOOP;
+            ELSIF OLD.status NOT IN ('Borrowed', 'Overdue')
+                  AND NEW.status IN ('Borrowed', 'Overdue') THEN
+                FOR v_item IN
+                    SELECT equipment_id, SUM(quantity)::INT AS quantity
+                    FROM borrow_items
+                    WHERE borrow_id = NEW.borrow_id
+                    GROUP BY equipment_id
+                    ORDER BY equipment_id
+                LOOP
+                    UPDATE equipment
+                    SET quantity_available = quantity_available - v_item.quantity
+                    WHERE equipment_id = v_item.equipment_id
+                      AND quantity_available >= v_item.quantity;
+                    IF NOT FOUND THEN
+                        RAISE EXCEPTION 'Not enough available stock to reactivate this borrowing transaction';
+                    END IF;
+                END LOOP;
+            END IF;
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        DROP TRIGGER IF EXISTS trg_sync_equipment_stock_on_status_change ON borrow_transactions;
+        CREATE TRIGGER trg_sync_equipment_stock_on_status_change
+        AFTER UPDATE OF status ON borrow_transactions
+        FOR EACH ROW
+        WHEN (OLD.status IS DISTINCT FROM NEW.status)
+        EXECUTE FUNCTION fn_sync_equipment_stock_on_status_change();
     ");
 } catch (Exception $e) {
-    // Silently fail if permissions don't allow object creation
+    error_log('Borrowing system database object setup failed: ' . $e->getMessage());
 }
 
 // FETCH EQUIPMENT FOR DROPDOWN & TABLE
 $equipment_list = $pdo->query('SELECT equipment_id, property_no, equipment_name, quantity_available FROM equipment ORDER BY equipment_name')->fetchAll(PDO::FETCH_ASSOC);
+$borrower_list = $pdo->query('SELECT borrower_id, borrower_no, full_name, borrower_type FROM borrowers ORDER BY borrower_no')->fetchAll(PDO::FETCH_ASSOC);
+$transactions = $pdo->query("
+    SELECT bt.borrow_id, bt.borrower_id, b.borrower_no, b.full_name, bt.borrow_date, bt.due_date, bt.status
+    FROM borrow_transactions bt
+    JOIN borrowers b ON b.borrower_id = bt.borrower_id
+    ORDER BY bt.borrow_date DESC, bt.borrow_id DESC
+")->fetchAll(PDO::FETCH_ASSOC);
+foreach ($transactions as &$transaction) {
+    $transaction['items'] = [];
+}
+unset($transaction);
+$transaction_items = $pdo->query("
+    SELECT bi.borrow_item_id, bi.borrow_id, bi.equipment_id, e.equipment_name, bi.quantity
+    FROM borrow_items bi
+    JOIN equipment e ON e.equipment_id = bi.equipment_id
+    ORDER BY bi.borrow_id, bi.borrow_item_id
+")->fetchAll(PDO::FETCH_ASSOC);
+$transactions_by_id = [];
+foreach ($transactions as $index => $transaction) {
+    $transactions_by_id[$transaction['borrow_id']] = $index;
+}
+foreach ($transaction_items as $item) {
+    if (isset($transactions_by_id[$item['borrow_id']])) {
+        $transactions[$transactions_by_id[$item['borrow_id']]]['items'][] = $item;
+    }
+}
 
 // Backend query using DISTINCT for Rubric Criteria 6
 $distinct_types = $pdo->query("SELECT DISTINCT borrower_type AS unique_role FROM borrowers WHERE borrower_type IS NOT NULL")->fetchAll(PDO::FETCH_COLUMN);
@@ -474,8 +801,56 @@ $monthly_report = $pdo->query("
 $vw_details = $pdo->query("SELECT borrower_no, full_name, equipment_name, quantity, borrow_date, due_date, status FROM vw_borrowing_details ORDER BY borrow_date DESC, full_name")->fetchAll(PDO::FETCH_ASSOC);
 $vw_usage   = $pdo->query("SELECT property_no, equipment_name, total_transactions, total_quantity_borrowed, availability_status FROM vw_equipment_usage ORDER BY equipment_name")->fetchAll(PDO::FETCH_ASSOC);
 
-// Transaction Status Summary (GROUP BY on status)
-$status_summary = $pdo->query("SELECT status, COUNT(*) AS total FROM borrow_transactions GROUP BY status ORDER BY status")->fetchAll(PDO::FETCH_ASSOC);
+// Exercise the CASE classifications at stock boundaries and transaction-status edge cases.
+$case_classification_tests = $pdo->query("
+    WITH cases (category, scenario, quantity_available, transaction_status, due_date, expected) AS (
+        VALUES
+            ('Availability', 'No stock', 0, NULL::text, NULL::date, 'Out of Stock'),
+            ('Availability', 'One item available', 1, NULL::text, NULL::date, 'Low Stock'),
+            ('Availability', 'Five items available', 5, NULL::text, NULL::date, 'Low Stock'),
+            ('Availability', 'Six items available', 6, NULL::text, NULL::date, 'Available'),
+            ('Transaction status', 'Explicitly overdue, due in future', NULL::integer, 'Overdue', CURRENT_DATE + 1, 'Overdue'),
+            ('Transaction status', 'Borrowed and past due', NULL::integer, 'Borrowed', CURRENT_DATE - 1, 'Overdue'),
+            ('Transaction status', 'Borrowed, due today', NULL::integer, 'Borrowed', CURRENT_DATE, 'Borrowed'),
+            ('Transaction status', 'Returned, past due', NULL::integer, 'Returned', CURRENT_DATE - 1, 'Returned'),
+            ('Transaction status', 'No transaction', NULL::integer, NULL::text, NULL::date, 'Not Borrowed')
+    ),
+    classified AS (
+        SELECT category, scenario, expected,
+               CASE
+                   WHEN category = 'Availability' THEN
+                       CASE
+                           WHEN quantity_available > 5 THEN 'Available'
+                           WHEN quantity_available BETWEEN 1 AND 5 THEN 'Low Stock'
+                           ELSE 'Out of Stock'
+                       END
+                   ELSE
+                       CASE
+                           WHEN transaction_status = 'Overdue'
+                             OR (transaction_status = 'Borrowed' AND due_date < CURRENT_DATE) THEN 'Overdue'
+                           ELSE COALESCE(transaction_status, 'Not Borrowed')
+                       END
+               END AS actual
+        FROM cases
+    )
+    SELECT category, scenario, expected, actual, actual = expected AS passed
+    FROM classified
+    ORDER BY CASE category WHEN 'Availability' THEN 1 ELSE 2 END, scenario
+")->fetchAll(PDO::FETCH_ASSOC);
+
+// Show every allowed transaction status, including statuses with no records yet.
+$status_summary = $pdo->query("
+    SELECT statuses.status, COUNT(bt.borrow_id) AS total
+    FROM (VALUES ('Pending'), ('Borrowed'), ('Returned'), ('Overdue')) AS statuses(status)
+    LEFT JOIN borrow_transactions bt ON bt.status = statuses.status
+    GROUP BY statuses.status
+    ORDER BY CASE statuses.status
+        WHEN 'Pending' THEN 1
+        WHEN 'Borrowed' THEN 2
+        WHEN 'Returned' THEN 3
+        WHEN 'Overdue' THEN 4
+    END
+")->fetchAll(PDO::FETCH_ASSOC);
 
 // Borrowers Without Transactions (LEFT JOIN + INITCAP/UPPER string functions)
 $borrowers_no_txn = $pdo->query("
@@ -502,44 +877,48 @@ $grouped_analysis = $pdo->query("
 // Aggregate functions per equipment: COUNT / SUM / AVG / MIN / MAX (+ ROUND)
 $equip_aggregates = $pdo->query("
     SELECT e.property_no, e.equipment_name,
-           COUNT(bi.borrow_item_id) AS times_borrowed,
+           COUNT(DISTINCT bi.borrow_id) AS times_borrowed,
            COALESCE(SUM(bi.quantity), 0) AS total_qty,
-           COALESCE(ROUND(AVG(bi.quantity)::numeric, 2), 0) AS avg_qty,
-           COALESCE(MIN(bi.quantity), 0) AS min_qty,
-           COALESCE(MAX(bi.quantity), 0) AS max_qty
+           ROUND(AVG(bi.quantity)::numeric, 2) AS avg_qty,
+           MIN(bi.quantity) AS min_qty,
+           MAX(bi.quantity) AS max_qty
     FROM equipment e
     LEFT JOIN borrow_items bi ON e.equipment_id = bi.equipment_id
     GROUP BY e.equipment_id, e.property_no, e.equipment_name
     ORDER BY times_borrowed DESC, e.equipment_name
 ")->fetchAll(PDO::FETCH_ASSOC);
 
-// Combined Borrower Activity: UNION ALL (keeps duplicates) across two compatible result sets
+// Compare the same active and overdue borrower sets with UNION ALL and UNION.
 $activity_union_all = $pdo->query("
-    SELECT INITCAP(b.full_name) AS borrower, 'Active' AS activity
+    SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status = 'borrowed'
+    WHERE bt.status IN ('Borrowed', 'Overdue')
     UNION ALL
-    SELECT INITCAP(b.full_name) AS borrower, 'Overdue' AS activity
+    SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status = 'borrowed' AND bt.due_date < CURRENT_DATE
-    ORDER BY activity, borrower
+    WHERE bt.status IN ('Borrowed', 'Overdue')
+      AND (bt.status = 'Overdue' OR bt.due_date < CURRENT_DATE)
+    ORDER BY borrower_no, borrower
 ")->fetchAll(PDO::FETCH_ASSOC);
 
-// Same two result sets combined with UNION (duplicates removed) to contrast with UNION ALL
+// UNION removes a borrower row that appears in both compatible result sets.
 $activity_union = $pdo->query("
-    SELECT INITCAP(b.full_name) AS borrower
+    SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status = 'borrowed'
+    WHERE bt.status IN ('Borrowed', 'Overdue')
     UNION
-    SELECT INITCAP(b.full_name)
+    SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status = 'borrowed' AND bt.due_date < CURRENT_DATE
-")->fetchAll(PDO::FETCH_COLUMN);
+    WHERE bt.status IN ('Borrowed', 'Overdue')
+      AND (bt.status = 'Overdue' OR bt.due_date < CURRENT_DATE)
+    ORDER BY borrower_no, borrower
+")->fetchAll(PDO::FETCH_ASSOC);
 
 // Demonstrate the Week 10 functions with different inputs (one row per equipment item)
 $fn_demo = $pdo->query("
     SELECT property_no, equipment_name, quantity_available,
            fn_check_equipment_availability(equipment_id, 1) AS can_lend_one,
+           fn_check_equipment_availability(equipment_id, quantity_available + 1) AS can_lend_one_more_than_available,
            fn_total_borrowed(equipment_id) AS total_borrowed_all_time
     FROM equipment
     ORDER BY equipment_name
@@ -555,15 +934,22 @@ $audit_log = $pdo->query("
 
 // --- Live, NON-DESTRUCTIVE self-tests: every scenario runs inside a transaction that is rolled back ---
 $self_tests = [];
+$transaction_rollback_test = null;
 $ref_borrower = $pdo->query("SELECT borrower_id FROM borrowers ORDER BY borrower_id LIMIT 1")->fetchColumn();
-$ref_equip    = $pdo->query("SELECT equipment_id FROM equipment WHERE quantity_available >= 1 ORDER BY equipment_id LIMIT 1")->fetchColumn();
+$ref_equip    = $pdo->query("SELECT equipment_id FROM equipment WHERE quantity_available >= 2 ORDER BY equipment_id LIMIT 1")->fetchColumn();
 $ref_property = $pdo->query("SELECT property_no FROM equipment ORDER BY equipment_id LIMIT 1")->fetchColumn();
+$ref_initial_stock = $ref_equip
+    ? (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = " . (int)$ref_equip)->fetchColumn()
+    : null;
+$ref_initial_borrowed = $ref_equip
+    ? (int)$pdo->query("SELECT fn_total_borrowed(" . (int)$ref_equip . ")")->fetchColumn()
+    : null;
 
 if ($ref_borrower && $ref_equip) {
     $pdo->beginTransaction();
     try {
         $test_borrow_id = $pdo->query("INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status)
-                                       VALUES ($ref_borrower, CURRENT_DATE, CURRENT_DATE + 2, 'borrowed')
+                                       VALUES ($ref_borrower, CURRENT_DATE, CURRENT_DATE + 2, 'Borrowed')
                                        RETURNING borrow_id")->fetchColumn();
 
         $sp_counter = 0;
@@ -573,8 +959,13 @@ if ($ref_borrower && $ref_equip) {
             $pdo->exec("SAVEPOINT $sp");
             try {
                 $detail = $fn();
-                $observed = 'Accepted' . ($detail ? ' — ' . $detail : '');
-                $ok = ($want === 'accept');
+                if (is_array($detail) && array_key_exists('passed', $detail) && array_key_exists('observed', $detail)) {
+                    $observed = (string)$detail['observed'];
+                    $ok = (bool)$detail['passed'];
+                } else {
+                    $observed = 'Accepted' . ($detail ? ' — ' . $detail : '');
+                    $ok = ($want === 'accept');
+                }
             } catch (Exception $e) {
                 $pdo->exec("ROLLBACK TO SAVEPOINT $sp");
                 $observed = 'Rejected — ' . friendlyError($e);
@@ -588,14 +979,129 @@ if ($ref_borrower && $ref_equip) {
             ];
         };
 
-        $runTest('Insert a valid borrowing item (BEFORE trigger + audit)', 'accept', function () use ($pdo, $test_borrow_id, $ref_equip) {
-            $pdo->exec("INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES ($test_borrow_id, $ref_equip, 1)");
-            $logged = $pdo->query("SELECT COUNT(*) FROM borrow_items_audit WHERE borrow_id = $test_borrow_id AND action = 'INSERT'")->fetchColumn();
-            return $logged ? 'audit INSERT logged by trigger' : 'audit row NOT logged';
+        $runTest('Availability function approves one item when stock exists', 'accept', function () use ($pdo, $ref_equip) {
+            $stmt = $pdo->prepare('SELECT fn_check_equipment_availability(:equipment_id, 1)');
+            $stmt->execute([':equipment_id' => $ref_equip]);
+            $result = $stmt->fetchColumn();
+            if (!in_array($result, [true, 't', '1', 1], true)) {
+                throw new RuntimeException('The function did not approve a one-item request with available stock.');
+            }
+            return 'returned Yes for one available item';
         });
 
-        $runTest('Borrow more than the available stock', 'reject', function () use ($pdo, $test_borrow_id, $ref_equip) {
-            $pdo->exec("INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES ($test_borrow_id, $ref_equip, 999999)");
+        $runTest('Availability function rejects a request above current stock', 'accept', function () use ($pdo, $ref_equip) {
+            $stmt = $pdo->prepare("
+                SELECT fn_check_equipment_availability(equipment_id, quantity_available + 1)
+                FROM equipment
+                WHERE equipment_id = :equipment_id
+            ");
+            $stmt->execute([':equipment_id' => $ref_equip]);
+            $result = $stmt->fetchColumn();
+            if (in_array($result, [true, 't', '1', 1], true)) {
+                throw new RuntimeException('The function approved a request exceeding available stock.');
+            }
+            return 'returned No for a request one above available stock';
+        });
+
+        $runTest('Availability function rejects unknown equipment', 'accept', function () use ($pdo) {
+            $result = $pdo->query('SELECT fn_check_equipment_availability(999999, 1)')->fetchColumn();
+            if (in_array($result, [true, 't', '1', 1], true)) {
+                throw new RuntimeException('The function approved an unknown equipment ID.');
+            }
+            return 'returned No for an unknown equipment ID';
+        });
+
+        $runTest('Availability function rejects nonpositive requests', 'accept', function () use ($pdo, $ref_equip) {
+            $stmt = $pdo->prepare('SELECT fn_check_equipment_availability(:equipment_id, 0)');
+            $stmt->execute([':equipment_id' => $ref_equip]);
+            $result = $stmt->fetchColumn();
+            if (in_array($result, [true, 't', '1', 1], true)) {
+                throw new RuntimeException('The function approved a zero-quantity request.');
+            }
+            return 'returned No for a zero-quantity request';
+        });
+
+        $runTest('Insert a valid borrowing item (BEFORE trigger + audit + stock sync)', 'accept', function () use ($pdo, $test_borrow_id, $ref_equip, $ref_initial_stock, $ref_initial_borrowed) {
+            $pdo->exec("INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES ($test_borrow_id, $ref_equip, 1)");
+            $stmtAudit = $pdo->prepare("
+                SELECT equipment_id, quantity, old_quantity, new_quantity
+                FROM borrow_items_audit
+                WHERE borrow_id = :borrow_id AND action = 'INSERT'
+                ORDER BY audit_id DESC
+                LIMIT 1
+            ");
+            $stmtAudit->execute([':borrow_id' => $test_borrow_id]);
+            $audit = $stmtAudit->fetch(PDO::FETCH_ASSOC);
+            $auditCount = (int)$pdo->query("SELECT COUNT(*) FROM borrow_items_audit WHERE borrow_id = $test_borrow_id AND action = 'INSERT'")->fetchColumn();
+            $stock = (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = $ref_equip")->fetchColumn();
+            $borrowed = (int)$pdo->query("SELECT fn_total_borrowed($ref_equip)")->fetchColumn();
+            if (!$audit || $auditCount !== 1 || (int)$audit['equipment_id'] !== (int)$ref_equip
+                || (int)$audit['quantity'] !== 1 || $audit['old_quantity'] !== null
+                || (int)$audit['new_quantity'] !== 1
+                || $stock !== $ref_initial_stock - 1 || $borrowed !== $ref_initial_borrowed + 1) {
+                throw new RuntimeException('Insert did not consistently update audit, available stock, and borrowed total.');
+            }
+            return 'one INSERT audit row recorded the equipment and new quantity 1; stock decreased by 1; borrowed total increased by 1';
+        });
+
+        $runTest('Insert exceeding available stock is rejected without side effects', 'reject', function () use ($pdo, $test_borrow_id, $ref_equip, $ref_initial_stock, $ref_initial_borrowed) {
+            $savepoint = 'overstock_insert_validation_check';
+            $pdo->exec("SAVEPOINT $savepoint");
+            $rejectedByValidationTrigger = false;
+            try {
+                $stmtInvalidInsert = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, 999999)');
+                $stmtInvalidInsert->execute([':borrow_id' => $test_borrow_id, ':equipment_id' => $ref_equip]);
+            } catch (PDOException $e) {
+                $rejectedByValidationTrigger = ($e->errorInfo[0] ?? null) === 'P0001';
+            }
+            $pdo->exec("ROLLBACK TO SAVEPOINT $savepoint");
+            $pdo->exec("RELEASE SAVEPOINT $savepoint");
+
+            $stock = (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = $ref_equip")->fetchColumn();
+            $borrowed = (int)$pdo->query("SELECT fn_total_borrowed($ref_equip)")->fetchColumn();
+            $itemCount = (int)$pdo->query("SELECT COUNT(*) FROM borrow_items WHERE borrow_id = $test_borrow_id AND equipment_id = $ref_equip")->fetchColumn();
+            $auditCount = (int)$pdo->query("SELECT COUNT(*) FROM borrow_items_audit WHERE borrow_id = $test_borrow_id AND equipment_id = $ref_equip")->fetchColumn();
+            $passed = $rejectedByValidationTrigger && $stock === $ref_initial_stock - 1
+                && $borrowed === $ref_initial_borrowed + 1 && $itemCount === 1 && $auditCount === 1;
+            return [
+                'passed' => $passed,
+                'observed' => $passed
+                    ? 'Rejected by BEFORE trigger; stock, borrowed total, item row, and INSERT audit remained unchanged'
+                    : 'Expected trigger rejection or unchanged stock/borrowed total/item/audit state was not confirmed',
+            ];
+        });
+
+        $runTest('BEFORE UPDATE rejects excess quantity and preserves existing item', 'accept', function () use ($pdo, $test_borrow_id, $ref_equip) {
+            $stmtOriginal = $pdo->prepare('SELECT quantity FROM borrow_items WHERE borrow_id = :borrow_id AND equipment_id = :equipment_id');
+            $stmtOriginal->execute([':borrow_id' => $test_borrow_id, ':equipment_id' => $ref_equip]);
+            $originalQuantity = $stmtOriginal->fetchColumn();
+            if ($originalQuantity === false) {
+                throw new RuntimeException('The valid test item is missing before the update check.');
+            }
+
+            $savepoint = 'before_update_validation_check';
+            $pdo->exec("SAVEPOINT $savepoint");
+            try {
+                $stmtInvalidUpdate = $pdo->prepare('UPDATE borrow_items SET quantity = 999999 WHERE borrow_id = :borrow_id AND equipment_id = :equipment_id');
+                $stmtInvalidUpdate->execute([':borrow_id' => $test_borrow_id, ':equipment_id' => $ref_equip]);
+                $pdo->exec("ROLLBACK TO SAVEPOINT $savepoint");
+                $pdo->exec("RELEASE SAVEPOINT $savepoint");
+                throw new RuntimeException('The BEFORE UPDATE trigger accepted a quantity above available stock.');
+            } catch (PDOException $e) {
+                $pdo->exec("ROLLBACK TO SAVEPOINT $savepoint");
+                $pdo->exec("RELEASE SAVEPOINT $savepoint");
+                if (($e->errorInfo[0] ?? null) !== 'P0001') {
+                    throw $e;
+                }
+            }
+
+            $stmtAfter = $pdo->prepare('SELECT quantity FROM borrow_items WHERE borrow_id = :borrow_id AND equipment_id = :equipment_id');
+            $stmtAfter->execute([':borrow_id' => $test_borrow_id, ':equipment_id' => $ref_equip]);
+            $quantityAfter = $stmtAfter->fetchColumn();
+            if ((string)$quantityAfter !== (string)$originalQuantity) {
+                throw new RuntimeException('The rejected update changed the existing borrowed quantity.');
+            }
+            return 'over-stock update was rejected; existing quantity remained ' . $originalQuantity;
         });
 
         $runTest('Same equipment twice in one transaction (unique)', 'reject', function () use ($pdo, $test_borrow_id, $ref_equip) {
@@ -606,8 +1112,35 @@ if ($ref_borrower && $ref_equip) {
             $pdo->exec("INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES ($test_borrow_id, 999999, 1)");
         });
 
+        $runTest('Borrow item with a negative quantity (check)', 'reject', function () use ($pdo, $test_borrow_id, $ref_equip) {
+            $stmt = $pdo->prepare("
+                INSERT INTO borrow_items (borrow_id, equipment_id, quantity)
+                VALUES (:borrow_id, :equipment_id, -1)
+            ");
+            $stmt->execute([':borrow_id' => $test_borrow_id, ':equipment_id' => $ref_equip]);
+        });
+
         $runTest('Set available stock below zero (check)', 'reject', function () use ($pdo, $ref_equip) {
             $pdo->exec("UPDATE equipment SET quantity_available = -1 WHERE equipment_id = $ref_equip");
+        });
+
+        $runTest('Duplicate borrower primary key', 'reject', function () use ($pdo, $ref_borrower) {
+            $stmt = $pdo->prepare("
+                INSERT INTO borrowers (borrower_id, borrower_no, full_name, borrower_type)
+                VALUES (:borrower_id, :borrower_no, 'Constraint Test', 'Student')
+            ");
+            $stmt->execute([
+                ':borrower_id' => $ref_borrower,
+                ':borrower_no' => 'TST-' . strtoupper(bin2hex(random_bytes(6))),
+            ]);
+        });
+
+        $runTest('Missing required borrower name (not-null)', 'reject', function () use ($pdo) {
+            $stmt = $pdo->prepare("
+                INSERT INTO borrowers (borrower_no, full_name, borrower_type)
+                VALUES (:borrower_no, NULL, 'Student')
+            ");
+            $stmt->execute([':borrower_no' => 'TST-' . strtoupper(bin2hex(random_bytes(6)))]);
         });
 
         if ($ref_property !== null && $ref_property !== '') {
@@ -617,21 +1150,91 @@ if ($ref_borrower && $ref_equip) {
             });
         }
 
-        $runTest('Update an item quantity (audit records old + new)', 'accept', function () use ($pdo, $test_borrow_id) {
+        $runTest('Update item quantity (audit + stock sync + borrowed total)', 'accept', function () use ($pdo, $test_borrow_id, $ref_equip, $ref_initial_stock, $ref_initial_borrowed) {
             $pdo->exec("UPDATE borrow_items SET quantity = 2 WHERE borrow_id = $test_borrow_id");
             $row = $pdo->query("SELECT old_quantity, new_quantity FROM borrow_items_audit WHERE borrow_id = $test_borrow_id AND action = 'UPDATE' ORDER BY audit_id DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
-            return ($row && $row['old_quantity'] !== null && $row['new_quantity'] !== null)
-                ? "audit UPDATE logged (old={$row['old_quantity']}, new={$row['new_quantity']})"
-                : 'audit UPDATE row NOT logged with old/new';
+            $stock = (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = $ref_equip")->fetchColumn();
+            $borrowed = (int)$pdo->query("SELECT fn_total_borrowed($ref_equip)")->fetchColumn();
+            if (!$row || (int)$row['old_quantity'] !== 1 || (int)$row['new_quantity'] !== 2
+                || $stock !== $ref_initial_stock - 2 || $borrowed !== $ref_initial_borrowed + 2) {
+                throw new RuntimeException('Update did not consistently record old/new quantities and reconcile stock and borrowed total.');
+            }
+            return "audit recorded 1 to 2; stock decreased by 2; borrowed total increased by 2";
         });
 
-        $runTest('Delete an item (audit records the old values)', 'accept', function () use ($pdo, $test_borrow_id) {
+        $runTest('Delete item (audit + stock restoration + borrowed total)', 'accept', function () use ($pdo, $test_borrow_id, $ref_equip, $ref_initial_stock, $ref_initial_borrowed) {
             $pdo->exec("DELETE FROM borrow_items WHERE borrow_id = $test_borrow_id");
-            $row = $pdo->query("SELECT old_quantity FROM borrow_items_audit WHERE borrow_id = $test_borrow_id AND action = 'DELETE' ORDER BY audit_id DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
-            return ($row && $row['old_quantity'] !== null)
-                ? 'audit DELETE logged (old=' . $row['old_quantity'] . ')'
-                : 'audit DELETE row NOT logged';
+            $row = $pdo->query("SELECT old_quantity, new_quantity FROM borrow_items_audit WHERE borrow_id = $test_borrow_id AND action = 'DELETE' ORDER BY audit_id DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+            $stock = (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = $ref_equip")->fetchColumn();
+            $borrowed = (int)$pdo->query("SELECT fn_total_borrowed($ref_equip)")->fetchColumn();
+            if (!$row || (int)$row['old_quantity'] !== 2 || $row['new_quantity'] !== null
+                || $stock !== $ref_initial_stock || $borrowed !== $ref_initial_borrowed) {
+                throw new RuntimeException('Delete did not record the old quantity and restore stock and borrowed total.');
+            }
+            return 'audit recorded deleted quantity 2; stock and borrowed total returned to baseline';
         });
+
+        $runTest('Status changes sync stock once without duplicate audit events', 'accept', function () use ($pdo, $ref_borrower, $ref_equip, $ref_initial_stock) {
+            $stmtTransaction = $pdo->prepare("
+                INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status)
+                VALUES (:borrower_id, CURRENT_DATE, CURRENT_DATE + 2, 'Pending')
+                RETURNING borrow_id
+            ");
+            $stmtTransaction->execute([':borrower_id' => $ref_borrower]);
+            $borrowId = (int)$stmtTransaction->fetchColumn();
+            $stmtItem = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, 1)');
+            $stmtItem->execute([':borrow_id' => $borrowId, ':equipment_id' => $ref_equip]);
+            $stockPending = (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = $ref_equip")->fetchColumn();
+
+            $stmtStatus = $pdo->prepare('UPDATE borrow_transactions SET status = :status WHERE borrow_id = :borrow_id');
+            $stmtStatus->execute([':status' => 'Borrowed', ':borrow_id' => $borrowId]);
+            $stockBorrowed = (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = $ref_equip")->fetchColumn();
+            $stmtStatus->execute([':status' => 'Returned', ':borrow_id' => $borrowId]);
+            $stockReturned = (int)$pdo->query("SELECT quantity_available FROM equipment WHERE equipment_id = $ref_equip")->fetchColumn();
+            $auditCount = (int)$pdo->query("SELECT COUNT(*) FROM borrow_items_audit WHERE borrow_id = $borrowId AND action = 'INSERT'")->fetchColumn();
+
+            if ($stockPending !== $ref_initial_stock || $stockBorrowed !== $ref_initial_stock - 1
+                || $stockReturned !== $ref_initial_stock || $auditCount !== 1) {
+                throw new RuntimeException('Status changes did not sync stock exactly once or created unexpected audit rows.');
+            }
+            return 'Pending kept stock; Borrowed reduced it once; Returned restored it; one item INSERT was audited';
+        });
+
+        $rollbackSavepoint = 'transaction_rollback_test';
+        $pdo->exec("SAVEPOINT $rollbackSavepoint");
+        $rollbackBorrowId = null;
+        $rollbackFailure = false;
+        $rollbackItemAttempted = false;
+        try {
+            $stmtRollbackHeader = $pdo->prepare("
+                INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status)
+                VALUES (:borrower_id, CURRENT_DATE, CURRENT_DATE + 2, 'Borrowed')
+                RETURNING borrow_id
+            ");
+            $stmtRollbackHeader->execute([':borrower_id' => $ref_borrower]);
+            $rollbackBorrowId = $stmtRollbackHeader->fetchColumn();
+
+            $stmtInvalidItem = $pdo->prepare("
+                INSERT INTO borrow_items (borrow_id, equipment_id, quantity)
+                VALUES (:borrow_id, -1, 1)
+            ");
+            $rollbackItemAttempted = true;
+            $stmtInvalidItem->execute([':borrow_id' => $rollbackBorrowId]);
+        } catch (Exception $e) {
+            $rollbackFailure = true;
+        }
+        $pdo->exec("ROLLBACK TO SAVEPOINT $rollbackSavepoint");
+        $stmtHeaderCheck = $pdo->prepare('SELECT COUNT(*) FROM borrow_transactions WHERE borrow_id = :borrow_id');
+        $stmtHeaderCheck->execute([':borrow_id' => $rollbackBorrowId]);
+        $headerRemoved = (int)$stmtHeaderCheck->fetchColumn() === 0;
+        $pdo->exec("RELEASE SAVEPOINT $rollbackSavepoint");
+        $transaction_rollback_test = [
+            'expected' => 'The failed item insert rolls back the transaction header; no partial borrowing remains.',
+            'observed' => $rollbackFailure && $rollbackItemAttempted && $headerRemoved
+                ? 'Invalid equipment was rejected and the temporary transaction header was removed.'
+                : 'The forced failure did not leave the database in the expected rolled-back state.',
+            'passed' => $rollbackFailure && $rollbackItemAttempted && $headerRemoved,
+        ];
     } catch (Exception $e) {
         // Safe to ignore — the rollback below discards any partial test data
     } finally {
@@ -648,71 +1251,85 @@ foreach ($self_tests as $t) {
 }
 
 // --- 1. DATA RETRIEVAL, FILTERING, & SORTING ---
-$search_name   = $_GET['search_name'] ?? '';
-$filter_type   = $_GET['filter_type'] ?? '';
-$filter_status = $_GET['filter_status'] ?? '';
-$date_from     = $_GET['date_from'] ?? '';
-$date_to       = $_GET['date_to'] ?? '';
-$sort_by       = $_GET['sort_by'] ?? 'b.borrower_id';
-$sort_dir      = $_GET['sort_dir'] ?? 'DESC';
+$search_name = $_GET['search_name'] ?? '';
+$search_name = is_string($search_name) ? trim($search_name) : '';
+$search_name = mb_substr($search_name, 0, 100, 'UTF-8');
+$filter_type_input = $_GET['filter_type'] ?? '';
+$filter_type = is_string($filter_type_input) ? ucfirst(strtolower(trim($filter_type_input))) : '';
+$filter_status_input = $_GET['filter_status'] ?? '';
+$filter_status = is_string($filter_status_input) ? ucfirst(strtolower(trim($filter_status_input))) : '';
+$filter_type   = in_array($filter_type, ['Student', 'Faculty', 'Staff'], true) ? $filter_type : '';
+$filter_status = in_array($filter_status, ['Pending', 'Borrowed', 'Returned', 'Overdue'], true) ? $filter_status : '';
+$date_from_input = $_GET['date_from'] ?? '';
+$date_from = validDate($date_from_input) ? $date_from_input : '';
+$date_to_input = $_GET['date_to'] ?? '';
+$date_to = validDate($date_to_input) ? $date_to_input : '';
+$sort_by_input = $_GET['sort_by'] ?? 'b.borrower_id';
+$sort_by = is_string($sort_by_input) ? $sort_by_input : 'b.borrower_id';
+$sort_dir_input = $_GET['sort_dir'] ?? 'DESC';
+$sort_dir = is_string($sort_dir_input) ? strtoupper($sort_dir_input) : 'DESC';
 
-// Allowed sort columns for safety
 $allowed_columns = ['b.borrower_id', 'b.full_name', 'bt.borrow_date', 'bt.due_date'];
-if (!in_array($sort_by, $allowed_columns)) $sort_by = 'b.borrower_id';
-if (!in_array($sort_dir, ['ASC', 'DESC'])) $sort_dir = 'DESC';
+if (!in_array($sort_by, $allowed_columns, true)) {
+    $sort_by = 'b.borrower_id';
+}
+if (!in_array($sort_dir, ['ASC', 'DESC'], true)) {
+    $sort_dir = 'DESC';
+}
 
 // --- 2. JOINS, SQL FUNCTIONS, & CONDITIONAL SQL ---
-// Using UPPER(), COALESCE(), and CASE expressions
 $query = "
-    SELECT 
+    SELECT
         b.borrower_id AS id, b.borrower_id AS borrower_id,
         b.borrower_no AS student_no, b.borrower_no AS borrower_no,
-        UPPER(b.full_name) AS full_name, 
+        bt.borrow_id AS borrow_id,
+        UPPER(b.full_name) AS full_name,
         b.borrower_type AS role, b.borrower_type AS borrower_type,
         COALESCE(e.equipment_name, 'N/A') AS equipment_name,
-        bi.quantity AS quantity,
-        bt.borrow_date AS borrow_date,
-        bt.due_date AS due_date,
+        bi.quantity,
+        bt.borrow_date,
+        bt.due_date,
         ABS(CURRENT_DATE - bt.due_date) AS days_difference,
-        CASE 
-            WHEN bt.due_date < CURRENT_DATE THEN 'Overdue'
-            ELSE 'On Time'
+        CASE
+            WHEN bt.status = 'Overdue'
+              OR (bt.status = 'Borrowed' AND bt.due_date < CURRENT_DATE) THEN 'Overdue'
+            ELSE COALESCE(bt.status, 'Not Borrowed')
         END AS status_check
     FROM borrowers b
     LEFT JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
     LEFT JOIN borrow_items bi ON bt.borrow_id = bi.borrow_id
     LEFT JOIN equipment e ON bi.equipment_id = e.equipment_id
-    WHERE 1=1
 ";
 
 $params = [];
-if ($search_name) {
-    $query .= " AND b.full_name ILIKE :search";
+$conditions = ['1 = 1'];
+if ($search_name !== '') {
+    $conditions[] = 'b.full_name ILIKE :search';
     $params[':search'] = "%$search_name%";
 }
-if ($filter_type) {
-    $query .= " AND b.borrower_type = :type";
+if ($filter_type !== '') {
+    $conditions[] = 'b.borrower_type = :type';
     $params[':type'] = $filter_type;
 }
-if ($filter_status) {
-    // Demonstrate IN: "overdue" also matches items still borrowed past their due date
-    if ($filter_status === 'overdue') {
-        $query .= " AND bt.status IN ('borrowed', 'overdue') AND bt.due_date < CURRENT_DATE";
+if ($filter_status !== '') {
+    if ($filter_status === 'Overdue') {
+        $conditions[] = "(bt.status = 'Overdue' OR (bt.status = 'Borrowed' AND bt.due_date < CURRENT_DATE))";
     } else {
-        $query .= " AND bt.status = :status";
+        $conditions[] = 'bt.status = :status';
         $params[':status'] = $filter_status;
     }
 }
 if ($date_from) {
-    $query .= " AND bt.borrow_date >= :date_from";
+    $conditions[] = 'bt.borrow_date >= :date_from';
     $params[':date_from'] = $date_from;
 }
 if ($date_to) {
-    $query .= " AND bt.borrow_date <= :date_to";
+    $conditions[] = 'bt.borrow_date <= :date_to';
     $params[':date_to'] = $date_to;
 }
 
-$query .= " ORDER BY $sort_by $sort_dir, b.full_name ASC";
+$query .= "\nWHERE " . implode("\n  AND ", $conditions);
+$query .= "\nORDER BY $sort_by $sort_dir, b.full_name ASC";
 
 $stmt = $pdo->prepare($query);
 $stmt->execute($params);
@@ -722,27 +1339,32 @@ $records = $stmt->fetchAll(PDO::FETCH_ASSOC);
 $kpi = $pdo->query("
     SELECT
         (SELECT COUNT(*) FROM borrowers) AS total_borrowers,
-        (SELECT COUNT(*) FROM borrow_transactions WHERE status = 'borrowed') AS active_borrowings,
+        (SELECT COUNT(*) FROM borrow_transactions WHERE status IN ('Borrowed', 'Overdue')) AS active_borrowings,
         (SELECT COALESCE(SUM(bi.quantity), 0)
            FROM borrow_items bi
            JOIN borrow_transactions bt ON bt.borrow_id = bi.borrow_id
-          WHERE bt.status = 'borrowed') AS items_out,
+          WHERE bt.status IN ('Borrowed', 'Overdue')) AS items_out,
         (SELECT COUNT(*) FROM borrow_transactions
-          WHERE status = 'borrowed' AND due_date < CURRENT_DATE) AS overdue
+          WHERE status IN ('Borrowed', 'Overdue') AND (status = 'Overdue' OR due_date < CURRENT_DATE)) AS overdue
 ")->fetch(PDO::FETCH_ASSOC);
 
 $summary_records = $pdo->query("
     SELECT
-        b.borrower_type,
+        borrower_types.borrower_type,
         COUNT(DISTINCT b.borrower_id) AS borrowers,
-        COUNT(DISTINCT CASE WHEN bt.status = 'borrowed' THEN bt.borrow_id END) AS borrowings,
-        COALESCE(SUM(CASE WHEN bt.status = 'borrowed' THEN bi.quantity ELSE 0 END), 0) AS items,
-        COUNT(DISTINCT CASE WHEN bt.status = 'borrowed' AND bt.due_date < CURRENT_DATE THEN bt.borrow_id END) AS overdue
-    FROM borrowers b
+        COUNT(DISTINCT CASE WHEN bt.status IN ('Borrowed', 'Overdue') THEN bt.borrow_id END) AS borrowings,
+        COALESCE(SUM(CASE WHEN bt.status IN ('Borrowed', 'Overdue') THEN bi.quantity ELSE 0 END), 0) AS items,
+        COUNT(DISTINCT CASE WHEN bt.status IN ('Borrowed', 'Overdue') AND (bt.status = 'Overdue' OR bt.due_date < CURRENT_DATE) THEN bt.borrow_id END) AS overdue
+    FROM (VALUES ('Student'), ('Faculty'), ('Staff')) AS borrower_types(borrower_type)
+    LEFT JOIN borrowers b ON b.borrower_type = borrower_types.borrower_type
     LEFT JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
     LEFT JOIN borrow_items bi ON bt.borrow_id = bi.borrow_id
-    GROUP BY b.borrower_type
-    ORDER BY b.borrower_type
+    GROUP BY borrower_types.borrower_type
+    ORDER BY CASE borrower_types.borrower_type
+        WHEN 'Student' THEN 1
+        WHEN 'Faculty' THEN 2
+        WHEN 'Staff' THEN 3
+    END
 ")->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!doctype html>
@@ -750,72 +1372,67 @@ $summary_records = $pdo->query("
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Advanced Borrower & Transaction CRUD</title>
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 1100px; margin: 30px auto; padding: 0 20px; background-color: #f4f7f6; }
-        h1, h2 { color: #333; }
-        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        form { margin-bottom: 0; }
-        input, select, button { padding: 10px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; }
-        button { background-color: #007bff; color: white; border: none; cursor: pointer; transition: background 0.3s; }
-        button:hover { background-color: #0056b3; }
-        button.delete { background-color: #dc3545; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { border-bottom: 1px solid #eee; padding: 12px; text-align: left; }
-        th { background-color: #f8f9fa; font-weight: 600; }
-        .badge { padding: 4px 8px; border-radius: 12px; font-size: 0.85em; }
-        .badge-overdue { background: #ffdada; color: #a94442; }
-         .badge-ontime { background: #d4edda; color: #155724; }
-         .kpi-grid { display: flex; gap: 20px; margin-bottom: 20px; }
-         .kpi { flex: 1; text-align: center; padding: 15px; border-radius: 8px; background: #f8f9fa; border: 1px solid #eee; }
-         .kpi-value { display: block; font-size: 1.8em; font-weight: 700; color: #007bff; }
-         .kpi-label { display: block; color: #666; font-size: 0.9em; margin-top: 4px; }
-         .kpi-alert .kpi-value { color: #dc3545; }
-         tr.total-row td { font-weight: 700; background: #f8f9fa; }
-
-         /* Alert Styles */
-         .alert { padding: 15px; margin-bottom: 20px; border: 1px solid transparent; border-radius: 4px; }
-         .alert-success { color: #155724; background-color: #d4edda; border-color: #c3e6cb; }
-         .alert-error { color: #721c24; background-color: #f8d7da; border-color: #f5c6cb; }
-         
-         /* Quick Action Styles */
-         .btn-edit { background-color: #ffc107; color: #212529; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
-         .btn-edit:hover { background-color: #e0a800; }
-         .action-group { display: flex; gap: 5px; }
-
-         /* Navigation */
-         .nav { position: sticky; top: 0; z-index: 20; display: flex; flex-wrap: wrap; gap: 8px; background: #007bff; padding: 10px 12px; border-radius: 8px; margin-bottom: 20px; }
-         .nav a { color: #fff; text-decoration: none; padding: 6px 12px; border-radius: 4px; font-size: 0.92em; }
-         .nav a:hover { background: rgba(255,255,255,0.25); }
-
-         /* Reports */
-         .report-note { color: #666; margin: 0 0 10px; font-size: 0.9em; }
-         .report-note code { background: #f1f3f5; padding: 1px 5px; border-radius: 3px; }
-         .card h3 { margin-bottom: 6px; }
-     </style>
+    <title>University Property Borrowing System</title>
+    <link rel="stylesheet" href="wk5_database2.css">
  </head>
  <body>
-     <nav class="nav">
-         <a href="#summary">Summary</a>
-         <a href="#filter">Search Records</a>
-         <a href="#create">Add Record</a>
-         <a href="#records">Records</a>
-         <a href="#equipment">Equipment</a>
-         <a href="#reports">Reports</a>
-     </nav>
-     <h1>Borrower & Transaction Management</h1>
+     <h1>University Property Borrowing System</h1>
 
-     <?php 
-     if (isset($_SESSION['flash'])) {
-         $flash = $_SESSION['flash'];
-         echo "<div class='alert alert-{$flash['type']}'>{$flash['msg']}</div>";
-         unset($_SESSION['flash']);
-     }
-     ?>
+    <?php if (isset($_SESSION['flash'])):
+        $flash = $_SESSION['flash'];
+        $flash_type = $flash['type'] === 'error' ? 'error' : 'success';
+        $flash_role = $flash_type === 'error' ? 'alert' : 'status';
+        unset($_SESSION['flash']);
+    ?>
+        <div class="alert alert-<?= $flash_type ?>" role="<?= $flash_role ?>"><?= htmlspecialchars($flash['msg'], ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endif; ?>
+
+    <nav class="module-tabs" role="tablist" aria-label="System modules">
+        <button type="button" id="tab-overview" role="tab" aria-controls="module-overview" aria-selected="true" data-module-tab="overview">Overview</button>
+        <button type="button" id="tab-borrowing" role="tab" aria-controls="module-borrowing" aria-selected="false" data-module-tab="borrowing" tabindex="-1">Borrowing</button>
+        <button type="button" id="tab-records" role="tab" aria-controls="module-records" aria-selected="false" data-module-tab="records" tabindex="-1">Records</button>
+        <button type="button" id="tab-borrowers" role="tab" aria-controls="module-borrowers" aria-selected="false" data-module-tab="borrowers" tabindex="-1">Borrowers</button>
+        <button type="button" id="tab-equipment" role="tab" aria-controls="module-equipment" aria-selected="false" data-module-tab="equipment" tabindex="-1">Equipment</button>
+        <button type="button" id="tab-reports" role="tab" aria-controls="module-reports" aria-selected="false" data-module-tab="reports" tabindex="-1">Reports</button>
+    </nav>
+
+    <section class="module-panel" id="module-overview" role="tabpanel" aria-labelledby="tab-overview" data-module-panel="overview">
+    <div class="card" id="database-connection">
+        <h2>Database Connection</h2>
+        <p role="status"><strong>Connected</strong> to PostgreSQL.</p>
+        <dl class="connection-details">
+            <div>
+                <dt>Connection mode</dt>
+                <dd><?= $is_local_database ? 'Local development' : 'Remote host configured' ?></dd>
+            </div>
+            <div>
+                <dt>Configured host</dt>
+                <dd><?= htmlspecialchars($host, ENT_QUOTES, 'UTF-8') ?></dd>
+            </div>
+            <div>
+                <dt>Port</dt>
+                <dd><?= htmlspecialchars($port, ENT_QUOTES, 'UTF-8') ?></dd>
+            </div>
+            <div>
+                <dt>Database</dt>
+                <dd><?= htmlspecialchars($connection_info['database_name'], ENT_QUOTES, 'UTF-8') ?></dd>
+            </div>
+            <div>
+                <dt>PostgreSQL version</dt>
+                <dd><?= htmlspecialchars($connection_info['server_version'], ENT_QUOTES, 'UTF-8') ?></dd>
+            </div>
+        </dl>
+        <?php if ($is_local_database): ?>
+            <p class="connection-note">This currently connects to PostgreSQL on the same computer. To meet the remote-architecture requirement, set the <code>DB_HOST</code> environment variable to the separate database computer's private network address.</p>
+        <?php else: ?>
+            <p class="connection-note">Confirm that this PostgreSQL server is on a separate computer and that its firewall and <code>pg_hba.conf</code> allow connections only from this XAMPP server. Do not expose port 5432 to the public internet.</p>
+        <?php endif; ?>
+    </div>
 
     <!-- Summary Section: at-a-glance KPIs + per-type breakdown -->
     <div class="card" id="summary">
         <h2>System Summary</h2>
+        <p class="report-note">Borrower totals are shown for every registered type, including categories with no current borrowers.</p>
         <div class="kpi-grid">
             <div class="kpi">
                 <span class="kpi-value"><?= (int)$kpi['total_borrowers'] ?></span>
@@ -871,91 +1488,91 @@ $summary_records = $pdo->query("
             </tbody>
         </table>
     </div>
+    </section>
 
-    <!-- Filter & Sort Section -->
-    <div class="card" id="filter">
-        <h2>Search & Filter</h2>
-        <form method="get">
-            <input type="text" name="search_name" placeholder="Search by name..." value="<?= htmlspecialchars($search_name) ?>">
-            <select name="filter_type">
-                <option value="">-- All Types --</option>
-                <option value="student" <?= $filter_type === 'student' ? 'selected' : '' ?>>Student</option>
-                <option value="faculty" <?= $filter_type === 'faculty' ? 'selected' : '' ?>>Faculty</option>
-            </select>
-            <select name="filter_status">
-                <option value="">-- All Statuses --</option>
-                <option value="borrowed" <?= $filter_status === 'borrowed' ? 'selected' : '' ?>>Borrowed</option>
-                <option value="returned" <?= $filter_status === 'returned' ? 'selected' : '' ?>>Returned</option>
-                <option value="overdue" <?= $filter_status === 'overdue' ? 'selected' : '' ?>>Overdue</option>
-            </select>
-            <label style="color:#666;font-size:0.9em;">From <input type="date" name="date_from" value="<?= htmlspecialchars($date_from) ?>"></label>
-            <label style="color:#666;font-size:0.9em;">To <input type="date" name="date_to" value="<?= htmlspecialchars($date_to) ?>"></label>
-            <select name="sort_by">
-                <option value="b.borrower_id" <?= $sort_by === 'b.borrower_id' ? 'selected' : '' ?>>Sort by ID</option>
-                <option value="b.full_name" <?= $sort_by === 'b.full_name' ? 'selected' : '' ?>>Sort by Name</option>
-                <option value="bt.borrow_date" <?= $sort_by === 'bt.borrow_date' ? 'selected' : '' ?>>Sort by Date</option>
-            </select>
-            <select name="sort_dir">
-                <option value="DESC" <?= $sort_dir === 'DESC' ? 'selected' : '' ?>>Descending</option>
-                <option value="ASC" <?= $sort_dir === 'ASC' ? 'selected' : '' ?>>Ascending</option>
-            </select>
-            <button type="submit">Apply Filter</button>
-            <a href="<?= $_SERVER['PHP_SELF'] ?>"><button type="button" style="background:#6c757d">Reset</button></a>
-        </form>
-    </div>
-
+    <section class="module-panel" id="module-borrowing" role="tabpanel" aria-labelledby="tab-borrowing" data-module-panel="borrowing" hidden>
     <div class="card" id="create">
-        <h2>Create Borrower & Checkout</h2>
-        <form method="post">
-            <input type="hidden" name="action" value="create">
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
-                <input type="text" name="borrower_no" placeholder="Borrower No." required>
-                <input type="text" name="full_name" placeholder="Full Name" required>
-                <select name="borrower_type" required>
-                    <option value="">-- Select Type --</option>
-                    <option value="student">Student</option>
-                    <option value="faculty">Faculty</option>
+        <h2 id="transaction-form-heading">Create Borrowing Transaction</h2>
+        <p class="workflow-note">Workflow: register the borrower in <strong>Borrowers</strong> and add available stock in <strong>Equipment</strong> first. Then select the borrower, dates, status, and one or more equipment items below.</p>
+        <p class="report-note">The transaction header and all item rows are saved atomically: any failed item write rolls back the whole operation.</p>
+        <?php if ($borrower_list && $equipment_list): ?>
+        <form method="post" id="transaction-form">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="action" value="create_transaction">
+            <input type="hidden" name="borrow_id" value="">
+            <div class="form-grid transaction-fields">
+                <label class="field">Borrower
+                <select name="borrower_id" required>
+                    <option value="">-- Select Borrower --</option>
+                    <?php foreach ($borrower_list as $borrower): ?>
+                        <option value="<?= (int)$borrower['borrower_id'] ?>"><?= htmlspecialchars($borrower['borrower_no'] . ' — ' . $borrower['full_name'], ENT_QUOTES, 'UTF-8') ?></option>
+                    <?php endforeach; ?>
                 </select>
+                </label>
+                <label class="field">Borrow date <input type="date" name="borrow_date" value="<?= date('Y-m-d') ?>" required></label>
+                <label class="field">Due date <input type="date" name="due_date" value="<?= date('Y-m-d', strtotime('+2 days')) ?>" required></label>
+                <label class="field">Status
+                <select name="status" required>
+                    <option value="Pending">Pending</option>
+                    <option value="Borrowed" selected>Borrowed</option>
+                    <option value="Returned">Returned</option>
+                    <option value="Overdue">Overdue</option>
+                </select>
+                </label>
             </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
-                <input type="date" name="borrow_date" value="<?= date('Y-m-d') ?>" required>
-                <input type="date" name="due_date" value="<?= date('Y-m-d', strtotime('+2 days')) ?>" required>
-            </div>
-            <p class="report-note" style="margin-top:12px;">Equipment items (add one row per item borrowed on this transaction):</p>
+            <p class="report-note item-section-label">Equipment items attached to this transaction:</p>
             <div id="items-container">
-                <div class="item-row" style="display: grid; grid-template-columns: 2fr 1fr auto; gap: 10px; margin-bottom: 6px;">
+                <div class="item-row">
+                    <input type="hidden" name="borrow_item_id[]" value="">
+                    <label class="field">Equipment
                     <select name="equipment_id[]" required>
                         <option value="">-- Equipment --</option>
                         <?php foreach ($equipment_list as $item): ?>
-                            <option value="<?= $item['equipment_id'] ?>"><?= htmlspecialchars($item['equipment_name'], ENT_QUOTES, 'UTF-8') ?></option>
+                            <option value="<?= (int)$item['equipment_id'] ?>"><?= htmlspecialchars($item['equipment_name'] . ' (available: ' . $item['quantity_available'] . ')', ENT_QUOTES, 'UTF-8') ?></option>
                         <?php endforeach; ?>
                     </select>
-                    <input type="number" name="quantity[]" placeholder="Qty" value="1" min="1" required>
-                    <button type="button" class="delete" onclick="removeItemRow(this)">Remove</button>
+                    </label>
+                    <label class="field">Quantity <input type="number" name="quantity[]" value="1" min="1" required></label>
+                    <button type="button" class="delete" onclick="removeItemRow(this)" aria-label="Remove this equipment row">Remove item</button>
                 </div>
             </div>
-            <button type="button" onclick="addItemRow()" style="background:#6c757d;margin-top:4px;">+ Add Item</button>
-            <button type="submit" style="margin-top: 10px; width: 100%;">Add Record</button>
+            <div class="form-actions">
+                <button type="button" class="button-muted" onclick="addItemRow()">+ Add Equipment Item</button>
+                <button type="submit" id="transaction-submit">Create Transaction</button>
+                <button type="button" id="transaction-cancel-edit" class="button-muted is-hidden" onclick="resetTransactionForm()">Cancel Edit</button>
+            </div>
         </form>
+        <?php else: ?>
+            <p class="report-note">Register at least one borrower and add equipment before creating a transaction.</p>
+        <?php endif; ?>
+    </div>
+    </section>
 
-        <form method="post" style="margin-top:16px; border-top:1px solid #eee; padding-top:12px;">
-            <p class="report-note">Or register a borrower <strong>without</strong> a checkout yet (this person then appears in the "Borrowers Without Transactions" report):</p>
-            <input type="hidden" name="action" value="create_borrower_only">
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px;">
-                <input type="text" name="borrower_no" placeholder="Borrower No." required>
-                <input type="text" name="full_name" placeholder="Full Name" required>
+    <section class="module-panel" id="module-borrowers" role="tabpanel" aria-labelledby="tab-borrowers" data-module-panel="borrowers" hidden>
+    <div class="card">
+        <h2>Register Borrower</h2>
+        <form method="post">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="action" value="create_borrower">
+            <div class="form-grid borrower-fields">
+                <label class="field">Borrower number <input type="text" name="borrower_no" maxlength="20" required></label>
+                <label class="field">Full name <input type="text" name="full_name" maxlength="100" required></label>
+                <label class="field">Borrower type
                 <select name="borrower_type" required>
                     <option value="">-- Type --</option>
-                    <option value="student">Student</option>
-                    <option value="faculty">Faculty</option>
+                    <option value="Student">Student</option>
+                    <option value="Faculty">Faculty</option>
+                    <option value="Staff">Staff</option>
                 </select>
-                <button type="submit" style="background:#28a745;">Register</button>
+                </label>
+                <button type="submit">Register</button>
             </div>
         </form>
     </div>
 
-    <div class="card" id="records">
-        <h2>Records</h2>
+    <div class="card" id="borrowers">
+        <h2>Borrower Directory</h2>
+        <?php if ($borrower_list): ?>
         <table>
             <thead>
                 <tr>
@@ -963,38 +1580,27 @@ $summary_records = $pdo->query("
                     <th>Borrower No.</th>
                     <th>Full Name</th>
                     <th>Type</th>
-                    <th>Equipment</th>
-                    <th>Qty</th>
-                    <th>Date</th>
-                    <th>Status</th>
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
-                <?php foreach ($records as $row): ?>
+                <?php foreach ($borrower_list as $borrower): ?>
                 <tr>
-                    <td><?= (int)$row['borrower_id'] ?></td>
-                    <td><?= htmlspecialchars($row['borrower_no'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars($row['full_name'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars(ucfirst($row['borrower_type'] ?? ''), ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars($row['equipment_name'] ?? 'None', ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= (int)($row['quantity'] ?? 0) ?></td>
-                    <td><?= htmlspecialchars($row['borrow_date'] ?? '-', ENT_QUOTES, 'UTF-8') ?></td>
-                    <td>
-                        <span class="badge badge-<?= $row['status_check'] === 'Overdue' ? 'overdue' : 'ontime' ?>">
-                            <?= $row['status_check'] ?>
-                        </span>
-                    </td>
+                    <td><?= (int)$borrower['borrower_id'] ?></td>
+                    <td><?= htmlspecialchars($borrower['borrower_no'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($borrower['full_name'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($borrower['borrower_type'], ENT_QUOTES, 'UTF-8') ?></td>
                     <td>
                         <div class="action-group">
-                            <button type="button" class="btn-edit" 
-                                onclick="fillBorrowerUpdate('<?= (int)$row['borrower_id'] ?>', '<?= htmlspecialchars($row['borrower_no'], ENT_QUOTES) ?>', '<?= htmlspecialchars($row['full_name'], ENT_QUOTES) ?>', '<?= htmlspecialchars($row['borrower_type'], ENT_QUOTES) ?>', '<?= htmlspecialchars($row['borrow_date'], ENT_QUOTES) ?>', '<?= htmlspecialchars($row['due_date'], ENT_QUOTES) ?>')">
+                            <button type="button" class="btn-edit"
+                                onclick='fillBorrowerUpdate(<?= json_encode((int)$borrower['borrower_id']) ?>, <?= json_encode($borrower['borrower_no'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['full_name'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['borrower_type'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>)'>
                                 Edit
                             </button>
-                            <form method="post" style="display:inline">
+                            <form method="post" class="inline-form">
+                                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
                                 <input type="hidden" name="action" value="delete">
-                                <input type="hidden" name="borrower_id" value="<?= (int)$row['borrower_id'] ?>">
-                                <button type="submit" class="delete" onclick="return confirm('Are you sure?')">Delete</button>
+                                <input type="hidden" name="borrower_id" value="<?= (int)$borrower['borrower_id'] ?>">
+                                <button type="submit" class="delete" onclick="return confirm('Delete this borrower and all of their borrowing records?')">Delete</button>
                             </form>
                         </div>
                     </td>
@@ -1002,50 +1608,205 @@ $summary_records = $pdo->query("
                 <?php endforeach; ?>
             </tbody>
         </table>
+        <?php else: ?>
+            <p class="report-note">No borrowers have been registered yet.</p>
+        <?php endif; ?>
     </div>
 
     <div class="card" id="borrower-update-card">
-        <h2>Update Record</h2>
+        <h2>Update Borrower</h2>
+        <p class="report-note">Choose <strong>Edit</strong> in the borrower directory to load a record into this form.</p>
         <form method="post">
-            <input type="hidden" name="action" value="update">
-            <div style="display: grid; grid-template-columns: 0.5fr 1fr 1.5fr 1fr; gap: 10px;">
-                <input type="number" name="borrower_id" id="upd_borrower_id" placeholder="ID" readonly required>
-                <input type="text" name="borrower_no" id="upd_borrower_no" placeholder="No." required>
-                <input type="text" name="full_name" id="upd_full_name" placeholder="Name" required>
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="action" value="update_borrower">
+            <div class="form-grid update-fields">
+                <label class="field">Borrower ID <input type="number" name="borrower_id" id="upd_borrower_id" readonly required></label>
+                <label class="field">Borrower number <input type="text" name="borrower_no" id="upd_borrower_no" maxlength="20" required></label>
+                <label class="field">Full name <input type="text" name="full_name" id="upd_full_name" maxlength="100" required></label>
+                <label class="field">Borrower type
                 <select name="borrower_type" id="upd_borrower_type" required>
                     <option value="">-- Type --</option>
-                    <option value="student">Student</option>
-                    <option value="faculty">Faculty</option>
+                    <option value="Student">Student</option>
+                    <option value="Faculty">Faculty</option>
+                    <option value="Staff">Staff</option>
                 </select>
+                </label>
             </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; margin-top: 10px;">
-                <select name="equipment_id" required>
-                    <option value="">-- Equipment --</option>
-                    <?php foreach ($equipment_list as $item): ?>
-                        <option value="<?= $item['equipment_id'] ?>"><?= htmlspecialchars($item['equipment_name'], ENT_QUOTES, 'UTF-8') ?></option>
-                    <?php endforeach; ?>
-                </select>
-                <input type="number" name="quantity" placeholder="Qty" value="1" min="1" required>
-                <input type="date" name="borrow_date" id="upd_borrow_date" value="<?= date('Y-m-d') ?>" required>
-                <input type="date" name="due_date" id="upd_due_date" value="<?= date('Y-m-d', strtotime('+2 days')) ?>" required>
+            <button type="submit" class="form-button-full button-success">Update Borrower</button>
+        </form>
+    </div>
+    </section>
+
+    <section class="module-panel" id="module-records" role="tabpanel" aria-labelledby="tab-records" data-module-panel="records" hidden>
+    <div class="card" id="filter">
+        <h2>Search, Filter &amp; Sort Transactions</h2>
+        <form method="get">
+            <input type="hidden" name="module" value="records">
+            <div class="form-grid search-fields">
+            <label class="field">Borrower name <input type="search" name="search_name" value="<?= htmlspecialchars($search_name, ENT_QUOTES, 'UTF-8') ?>"></label>
+            <label class="field">Borrower type
+            <select name="filter_type">
+                <option value="">-- All Types --</option>
+                <option value="Student" <?= $filter_type === 'Student' ? 'selected' : '' ?>>Student</option>
+                <option value="Faculty" <?= $filter_type === 'Faculty' ? 'selected' : '' ?>>Faculty</option>
+                <option value="Staff" <?= $filter_type === 'Staff' ? 'selected' : '' ?>>Staff</option>
+            </select>
+            </label>
+            <label class="field">Transaction status
+            <select name="filter_status">
+                <option value="">-- All Statuses --</option>
+                <option value="Pending" <?= $filter_status === 'Pending' ? 'selected' : '' ?>>Pending</option>
+                <option value="Borrowed" <?= $filter_status === 'Borrowed' ? 'selected' : '' ?>>Borrowed</option>
+                <option value="Returned" <?= $filter_status === 'Returned' ? 'selected' : '' ?>>Returned</option>
+                <option value="Overdue" <?= $filter_status === 'Overdue' ? 'selected' : '' ?>>Overdue</option>
+            </select>
+            </label>
+            <label class="field">Borrow date from <input type="date" name="date_from" value="<?= htmlspecialchars($date_from, ENT_QUOTES, 'UTF-8') ?>"></label>
+            <label class="field">Borrow date to <input type="date" name="date_to" value="<?= htmlspecialchars($date_to, ENT_QUOTES, 'UTF-8') ?>"></label>
+            <label class="field">Sort by
+            <select name="sort_by">
+                <option value="b.borrower_id" <?= $sort_by === 'b.borrower_id' ? 'selected' : '' ?>>Borrower ID</option>
+                <option value="b.full_name" <?= $sort_by === 'b.full_name' ? 'selected' : '' ?>>Borrower name</option>
+                <option value="bt.borrow_date" <?= $sort_by === 'bt.borrow_date' ? 'selected' : '' ?>>Borrow date</option>
+            </select>
+            </label>
+            <label class="field">Order
+            <select name="sort_dir">
+                <option value="DESC" <?= $sort_dir === 'DESC' ? 'selected' : '' ?>>Descending</option>
+                <option value="ASC" <?= $sort_dir === 'ASC' ? 'selected' : '' ?>>Ascending</option>
+            </select>
+            </label>
             </div>
-            <button type="submit" style="margin-top: 10px; width: 100%; background-color: #28a745;">Update Record</button>
+            <div class="form-actions">
+                <button type="submit">Apply filters</button>
+                <a class="button-link" href="<?= htmlspecialchars($_SERVER['PHP_SELF'], ENT_QUOTES, 'UTF-8') ?>?module=records">Reset filters</a>
+            </div>
         </form>
     </div>
 
+    <div class="card" id="filtered-results">
+        <h2>Filtered Borrower and Transaction Results</h2>
+        <p class="report-note">
+            <?= count($records) ?> matching row<?= count($records) === 1 ? '' : 's' ?>.
+            Rows match all selected filters; overdue includes transactions marked Overdue or Borrowed past their due date.
+            Results use the selected sort field and direction, with borrower name A–Z as a tie-breaker.
+            Absolute days from the due date are calculated with <code>ABS()</code>; the value is a distance, while status indicates the transaction state.
+        </p>
+        <?php if ($records): ?>
+        <table>
+            <thead>
+                <tr>
+                    <th>Borrower No.</th>
+                    <th>Borrower</th>
+                    <th>Type</th>
+                    <th>Equipment</th>
+                    <th>Quantity</th>
+                    <th>Borrow Date</th>
+                    <th>Due Date</th>
+                    <th>Absolute Due-Date Gap</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($records as $record): ?>
+                <tr>
+                    <td><?= htmlspecialchars($record['borrower_no'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($record['full_name'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($record['borrower_type'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($record['borrow_id'] === null ? 'No equipment borrowed' : $record['equipment_name'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= $record['quantity'] === null ? '—' : (int)$record['quantity'] ?></td>
+                    <td><?= htmlspecialchars($record['borrow_date'] ?? '—', ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($record['due_date'] ?? '—', ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= $record['days_difference'] === null ? '—' : (int)$record['days_difference'] . ' days' ?></td>
+                    <td><?= htmlspecialchars($record['status_check'], ENT_QUOTES, 'UTF-8') ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php else: ?>
+            <p class="report-note">No records match these filters. Change or reset the filters to see results.</p>
+        <?php endif; ?>
+    </div>
+
+    <div class="card" id="records">
+        <h2>Borrowing Transactions</h2>
+        <?php if ($transactions): ?>
+        <table>
+            <thead>
+                <tr>
+                    <th>Transaction</th>
+                    <th>Borrower No.</th>
+                    <th>Full Name</th>
+                    <th>Borrow Date</th>
+                    <th>Due Date</th>
+                    <th>Status</th>
+                    <th>Borrowed Items</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($transactions as $transaction):
+                    $transaction_json = json_encode($transaction, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP);
+                ?>
+                <tr>
+                    <td>#<?= (int)$transaction['borrow_id'] ?></td>
+                    <td><?= htmlspecialchars($transaction['borrower_no'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($transaction['full_name'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($transaction['borrow_date'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($transaction['due_date'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td>
+                        <?= htmlspecialchars($transaction['status'], ENT_QUOTES, 'UTF-8') ?>
+                        <?php if ($transaction['status'] === 'Borrowed' && $transaction['due_date'] < date('Y-m-d')): ?>
+                            <span class="badge badge-overdue">Past Due</span>
+                        <?php endif; ?>
+                    </td>
+                    <td>
+                        <?php if ($transaction['items']): ?>
+                            <ul>
+                                <?php foreach ($transaction['items'] as $item): ?>
+                                    <li><?= htmlspecialchars($item['equipment_name'], ENT_QUOTES, 'UTF-8') ?> &times; <?= (int)$item['quantity'] ?></li>
+                                <?php endforeach; ?>
+                            </ul>
+                        <?php else: ?>
+                            No items
+                        <?php endif; ?>
+                    </td>
+                    <td>
+                        <div class="action-group">
+                            <button type="button" class="btn-edit" data-transaction="<?= htmlspecialchars($transaction_json, ENT_QUOTES, 'UTF-8') ?>" onclick="editTransaction(this)">Edit</button>
+                            <form method="post" class="inline-form" onsubmit="return confirm('Delete this transaction and all of its borrowed items?');">
+                                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                                <input type="hidden" name="action" value="delete_transaction">
+                                <input type="hidden" name="borrow_id" value="<?= (int)$transaction['borrow_id'] ?>">
+                                <button type="submit" class="delete">Delete</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php else: ?>
+            <p class="report-note">No borrowing transactions have been created yet.</p>
+        <?php endif; ?>
+    </div>
+    </section>
+
+    <section class="module-panel" id="module-equipment" role="tabpanel" aria-labelledby="tab-equipment" data-module-panel="equipment" hidden>
     <hr id="equipment">
     <h1>Equipment Management</h1>
 
     <div class="card">
         <h2>Add Equipment</h2>
         <form method="post">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
             <input type="hidden" name="action" value="create_equipment">
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
-                <input type="text" name="property_no" placeholder="Property No." required>
-                <input type="text" name="equipment_name" placeholder="Equipment Name" required>
-                <input type="number" name="quantity_available" placeholder="Available Quantity" min="0" required>
+            <div class="form-grid equipment-fields">
+                <label class="field">Property number <input type="text" name="property_no" maxlength="20" required></label>
+                <label class="field">Equipment name <input type="text" name="equipment_name" maxlength="100" required></label>
+                <label class="field">Initial available quantity <input type="number" name="quantity_available" min="0" required></label>
             </div>
-            <button type="submit" style="margin-top: 10px; width: 100%;">Add Equipment</button>
+            <button type="submit" class="form-button-full">Add Equipment</button>
         </form>
     </div>
 
@@ -1062,6 +1823,9 @@ $summary_records = $pdo->query("
                 </tr>
             </thead>
             <tbody>
+                <?php if (!$equipment_list): ?>
+                    <tr><td colspan="5">No equipment has been added yet.</td></tr>
+                <?php endif; ?>
                 <?php foreach ($equipment_list as $eq): ?>
                 <tr>
                     <td><?= (int)$eq['equipment_id'] ?></td>
@@ -1074,7 +1838,8 @@ $summary_records = $pdo->query("
                                 onclick="fillEquipmentUpdate('<?= (int)$eq['equipment_id'] ?>', '<?= htmlspecialchars($eq['property_no'], ENT_QUOTES) ?>', '<?= htmlspecialchars($eq['equipment_name'], ENT_QUOTES) ?>', '<?= (int)$eq['quantity_available'] ?>')">
                                 Edit
                             </button>
-                            <form method="post" style="display:inline">
+                            <form method="post" class="inline-form">
+                                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
                                 <input type="hidden" name="action" value="delete_equipment">
                                 <input type="hidden" name="equipment_id" value="<?= (int)$eq['equipment_id'] ?>">
                                 <button type="submit" class="delete" onclick="return confirm('Are you sure you want to delete this equipment?')">Delete</button>
@@ -1089,18 +1854,22 @@ $summary_records = $pdo->query("
 
     <div class="card" id="equipment-update-card">
         <h2>Update Equipment</h2>
+        <p class="report-note">Choose <strong>Edit</strong> in the equipment inventory to load a record into this form.</p>
         <form method="post" id="equipment-update-form">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
             <input type="hidden" name="action" value="update_equipment">
-            <div style="display: grid; grid-template-columns: 0.5fr 1fr 1.5fr 1fr; gap: 10px;">
-                <input type="number" name="equipment_id" id="upd_eq_id" placeholder="ID" readonly required>
-                <input type="text" name="property_no" id="upd_eq_prop" placeholder="Property No." required>
-                <input type="text" name="equipment_name" id="upd_eq_name" placeholder="Name" required>
-                <input type="number" name="quantity_available" id="upd_eq_qty" placeholder="Qty" min="0" required>
+            <div class="form-grid update-fields">
+                <label class="field">Equipment ID <input type="number" name="equipment_id" id="upd_eq_id" readonly required></label>
+                <label class="field">Property number <input type="text" name="property_no" id="upd_eq_prop" maxlength="20" required></label>
+                <label class="field">Equipment name <input type="text" name="equipment_name" id="upd_eq_name" maxlength="100" required></label>
+                <label class="field">Available quantity <input type="number" name="quantity_available" id="upd_eq_qty" min="0" required></label>
             </div>
-            <button type="submit" style="margin-top: 10px; width: 100%; background-color: #28a745;">Update Equipment</button>
+            <button type="submit" class="form-button-full button-success">Update Equipment</button>
         </form>
     </div>
+    </section>
 
+    <section class="module-panel" id="module-reports" role="tabpanel" aria-labelledby="tab-reports" data-module-panel="reports" hidden>
     <!-- ================= REPORTS (Week 6-8 SQL) ================= -->
     <hr id="reports">
     <h1>Reports</h1>
@@ -1136,7 +1905,7 @@ $summary_records = $pdo->query("
     <!-- Equipment Borrowing Summary: view vw_equipment_usage (LEFT JOIN + COUNT/SUM + CASE) -->
     <div class="card">
         <h2>Equipment Borrowing Summary</h2>
-        <p class="report-note">Source: view <code>vw_equipment_usage</code> &mdash; LEFT JOIN with COUNT()/SUM() aggregation and a CASE availability classification.</p>
+        <p class="report-note">Source: view <code>vw_equipment_usage</code> &mdash; LEFT JOIN with COUNT()/SUM() aggregation and an ordered CASE classification: more than 5 available = Available, 1&ndash;5 = Low Stock, and 0 = Out of Stock.</p>
         <table>
             <thead>
                 <tr><th>Property No.</th><th>Equipment</th><th>Transactions</th><th>Total Qty Borrowed</th><th>Availability</th></tr>
@@ -1149,6 +1918,25 @@ $summary_records = $pdo->query("
                     <td><?= (int)($r['total_transactions'] ?? 0) ?></td>
                     <td><?= (int)($r['total_quantity_borrowed'] ?? 0) ?></td>
                     <td><?= htmlspecialchars($r['availability_status'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>CASE Classification Checks</h2>
+        <p class="report-note">Read-only SQL checks cover inventory thresholds and transaction-status boundaries. Overdue takes precedence for an explicitly overdue transaction or a borrowed transaction past its due date; due today is not overdue.</p>
+        <table>
+            <thead><tr><th>Classification</th><th>Scenario</th><th>Expected</th><th>Actual</th><th>Result</th></tr></thead>
+            <tbody>
+                <?php foreach ($case_classification_tests as $test): ?>
+                <tr>
+                    <td><?= htmlspecialchars($test['category'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($test['scenario'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($test['expected'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($test['actual'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><span class="badge <?= $test['passed'] === true || $test['passed'] === 't' ? 'badge-ontime' : 'badge-overdue' ?>"><?= $test['passed'] === true || $test['passed'] === 't' ? 'PASS' : 'FAIL' ?></span></td>
                 </tr>
                 <?php endforeach; ?>
             </tbody>
@@ -1197,7 +1985,7 @@ $summary_records = $pdo->query("
     <!-- Transaction Status Summary: GROUP BY on status -->
     <div class="card">
         <h2>Transaction Status Summary</h2>
-        <p class="report-note">Source: <code>GROUP BY</code> on transaction status.</p>
+        <p class="report-note">Source: <code>GROUP BY</code> on transaction status. Every allowed status is listed, including statuses with zero transactions.</p>
         <table>
             <thead><tr><th>Status</th><th>Transactions</th></tr></thead>
             <tbody>
@@ -1236,7 +2024,7 @@ $summary_records = $pdo->query("
     <!-- Grouped Borrowing Analysis: GROUP BY + HAVING -->
     <div class="card">
         <h2>Grouped Borrowing Analysis</h2>
-        <p class="report-note">Source: <code>GROUP BY borrower_type</code> + <code>HAVING COUNT(*) &gt;= 2</code> &mdash; borrower types with two or more transactions.</p>
+        <p class="report-note">Source: <code>GROUP BY borrower_type</code> groups transactions by borrower type. <code>WHERE</code> filters individual rows before grouping; <code>HAVING COUNT(DISTINCT borrow_id) &gt;= 2</code> filters the grouped results to borrower types with two or more transactions.</p>
         <?php if ($grouped_analysis): ?>
         <table>
             <thead><tr><th>Borrower Type</th><th>Transactions</th><th>Total Items Borrowed</th></tr></thead>
@@ -1258,10 +2046,10 @@ $summary_records = $pdo->query("
     <!-- Aggregate Functions per Equipment: COUNT/SUM/AVG/MIN/MAX + ROUND -->
     <div class="card">
         <h2>Equipment Aggregate Summary</h2>
-        <p class="report-note">Source: <code>COUNT()</code>, <code>SUM()</code>, <code>AVG()</code>, <code>MIN()</code>, <code>MAX()</code> with <code>ROUND()</code>.</p>
+        <p class="report-note">All-time borrowing history, including returned transactions. Count is distinct borrowing transactions; total is quantity borrowed; average, minimum, and maximum are per transaction. The average uses <code>ROUND(AVG(quantity), 2)</code>. Equipment with no borrowing history shows 0 transactions and total quantity, with dashes for undefined per-transaction values.</p>
         <table>
             <thead>
-                <tr><th>Property No.</th><th>Equipment</th><th>Times Borrowed</th><th>Total Qty</th><th>Avg Qty</th><th>Min Qty</th><th>Max Qty</th></tr>
+                <tr><th>Property No.</th><th>Equipment</th><th>Borrow Transactions</th><th>Total Qty Borrowed</th><th>Avg Qty / Transaction</th><th>Min Qty / Transaction</th><th>Max Qty / Transaction</th></tr>
             </thead>
             <tbody>
                 <?php foreach ($equip_aggregates as $r): ?>
@@ -1270,40 +2058,59 @@ $summary_records = $pdo->query("
                     <td><?= htmlspecialchars($r['equipment_name'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= (int)($r['times_borrowed'] ?? 0) ?></td>
                     <td><?= (int)($r['total_qty'] ?? 0) ?></td>
-                    <td><?= htmlspecialchars((string)($r['avg_qty'] ?? 0), ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= (int)($r['min_qty'] ?? 0) ?></td>
-                    <td><?= (int)($r['max_qty'] ?? 0) ?></td>
+                    <td><?= $r['avg_qty'] === null ? '—' : htmlspecialchars((string)$r['avg_qty'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= $r['min_qty'] === null ? '—' : (int)$r['min_qty'] ?></td>
+                    <td><?= $r['max_qty'] === null ? '—' : (int)$r['max_qty'] ?></td>
                 </tr>
                 <?php endforeach; ?>
             </tbody>
         </table>
     </div>
 
-    <!-- Combined Borrower Activity: UNION ALL vs UNION -->
+    <!-- Active vs overdue borrower sets: UNION ALL vs UNION -->
     <div class="card">
-        <h2>Combined Borrower Activity</h2>
-        <p class="report-note">Source: two compatible result sets combined with <code>UNION ALL</code> (keeps duplicates) vs <code>UNION</code> (removes them). Rows: UNION ALL = <?= count($activity_union_all) ?>, UNION = <?= count($activity_union) ?>.</p>
+        <h2>Active vs. Overdue Borrowers: Set Operations</h2>
+        <p class="report-note">Both queries return the same borrower number and name columns. The first set contains borrowers with active transactions; the second contains borrowers with overdue transactions. A borrower in both sets appears twice with <code>UNION ALL</code> and once with <code>UNION</code>.</p>
+        <h3><code>UNION ALL</code> <span class="report-note">(<?= count($activity_union_all) ?> rows; keeps duplicates)</span></h3>
+        <?php if ($activity_union_all): ?>
         <table>
-            <thead><tr><th>Borrower</th><th>Activity</th></tr></thead>
+            <thead><tr><th>Borrower No.</th><th>Borrower</th></tr></thead>
             <tbody>
                 <?php foreach ($activity_union_all as $r): ?>
                 <tr>
+                    <td><?= htmlspecialchars($r['borrower_no'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= htmlspecialchars($r['borrower'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars($r['activity'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                 </tr>
                 <?php endforeach; ?>
             </tbody>
         </table>
-        <h3>Distinct borrowers across both sets <span class="report-note">(<code>UNION</code>)</span></h3>
-        <p class="report-note"><?= $activity_union ? htmlspecialchars(implode(', ', $activity_union), ENT_QUOTES, 'UTF-8') : 'None' ?></p>
+        <?php else: ?>
+            <p class="report-note">No active or overdue borrowers.</p>
+        <?php endif; ?>
+        <h3><code>UNION</code> <span class="report-note">(<?= count($activity_union) ?> rows; removes duplicate rows)</span></h3>
+        <?php if ($activity_union): ?>
+        <table>
+            <thead><tr><th>Borrower No.</th><th>Borrower</th></tr></thead>
+            <tbody>
+                <?php foreach ($activity_union as $r): ?>
+                <tr>
+                    <td><?= htmlspecialchars($r['borrower_no'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($r['borrower'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php else: ?>
+            <p class="report-note">No active or overdue borrowers.</p>
+        <?php endif; ?>
     </div>
 
     <!-- Week 10 function demonstration -->
     <div class="card">
         <h2>Function Demonstration</h2>
-        <p class="report-note">Source: <code>fn_total_borrowed()</code> (SQL function) and <code>fn_check_equipment_availability()</code> (PL/pgSQL), called once per equipment row.</p>
+        <p class="report-note">Source: <code>fn_total_borrowed()</code> (SQL function) and <code>fn_check_equipment_availability()</code> (PL/pgSQL). The total counts every recorded borrowing-item quantity regardless of transaction status, including pending, borrowed, and returned transactions. The availability function returns No for missing equipment, nonpositive requests, or requests above available stock.</p>
         <table>
-            <thead><tr><th>Property No.</th><th>Equipment</th><th>Available</th><th>Can Lend 1?</th><th>Total Borrowed (all time)</th></tr></thead>
+            <thead><tr><th>Property No.</th><th>Equipment</th><th>Available</th><th>Can Lend 1?</th><th>Can Lend Available + 1?</th><th>Total Borrowed (all time)</th></tr></thead>
             <tbody>
                 <?php foreach ($fn_demo as $r):
                     $can = ($r['can_lend_one'] === true || $r['can_lend_one'] === 't');
@@ -1313,6 +2120,7 @@ $summary_records = $pdo->query("
                     <td><?= htmlspecialchars($r['equipment_name'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= (int)($r['quantity_available'] ?? 0) ?></td>
                     <td><?= $can ? 'Yes' : 'No' ?></td>
+                    <td><?= ($r['can_lend_one_more_than_available'] === true || $r['can_lend_one_more_than_available'] === 't') ? 'Yes' : 'No' ?></td>
                     <td><?= (int)($r['total_borrowed_all_time'] ?? 0) ?></td>
                 </tr>
                 <?php endforeach; ?>
@@ -1351,7 +2159,10 @@ $summary_records = $pdo->query("
         <h2>Validation &amp; Trigger Self-Test</h2>
         <p class="report-note">
             Each scenario below is executed <strong>live against PostgreSQL</strong> inside a transaction that is
-            <strong>rolled back</strong>, so no data is permanently changed. Passed
+            <strong>rolled back</strong>, so no data is permanently changed. The checks cover primary-key, foreign-key,
+            unique, not-null, and check constraints, along with the BEFORE INSERT/UPDATE borrowing-quantity trigger.
+            Integration checks compare the SQL function's borrowed total, audited old/new values, and available stock
+            across item insert, update, delete, and Pending/Borrowed/Returned status changes. Passed
             <strong><?= $self_test_pass ?>/<?= count($self_tests) ?></strong>.
         </p>
         <?php if ($self_tests): ?>
@@ -1369,7 +2180,27 @@ $summary_records = $pdo->query("
             </tbody>
         </table>
         <?php else: ?>
-            <p class="report-note">Self-tests unavailable — no borrower or equipment records to reference.</p>
+            <p class="report-note">Self-tests unavailable — the integration checks require a registered borrower and at least one equipment item with two or more units available.</p>
+        <?php endif; ?>
+    </div>
+
+    <div class="card">
+        <h2>Transaction Management Check</h2>
+        <p class="report-note">Create, update, and delete workflows run related header/item writes inside a database transaction, committing only after all writes succeed and rolling back on errors. The check below forces an invalid item insert after a temporary header insert, then verifies the header was rolled back. All test work is rolled back and no borrowing data is retained.</p>
+        <?php if ($transaction_rollback_test !== null): ?>
+        <table>
+            <thead><tr><th>Test Scenario</th><th>Expected Behavior</th><th>Observed Result</th><th>Result</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td>Failed multi-step borrowing transaction</td>
+                    <td><?= htmlspecialchars($transaction_rollback_test['expected'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($transaction_rollback_test['observed'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><span class="badge <?= $transaction_rollback_test['passed'] ? 'badge-ontime' : 'badge-overdue' ?>"><?= $transaction_rollback_test['passed'] ? 'PASS' : 'FAIL' ?></span></td>
+                </tr>
+            </tbody>
+        </table>
+        <?php else: ?>
+            <p class="report-note">Rollback test unavailable because no borrower and equipment records are available.</p>
         <?php endif; ?>
     </div>
 
@@ -1389,45 +2220,8 @@ $summary_records = $pdo->query("
             <?= $name_labels ? htmlspecialchars(implode('; ', $name_labels), ENT_QUOTES, 'UTF-8') : 'None' ?>
         </p>
     </div>
+    </section>
 
-    <script>
-        function fillBorrowerUpdate(id, no, name, type, borrowDate, dueDate) {
-            document.getElementById('upd_borrower_id').value = id;
-            document.getElementById('upd_borrower_no').value = no;
-            document.getElementById('upd_full_name').value = name;
-            document.getElementById('upd_borrower_type').value = type;
-            document.getElementById('upd_borrow_date').value = borrowDate;
-            document.getElementById('upd_due_date').value = dueDate;
-            
-            document.getElementById('borrower-update-card').scrollIntoView({ behavior: 'smooth' });
-        }
-
-        function fillEquipmentUpdate(id, prop, name, qty) {
-            document.getElementById('upd_eq_id').value = id;
-            document.getElementById('upd_eq_prop').value = prop;
-            document.getElementById('upd_eq_name').value = name;
-            document.getElementById('upd_eq_qty').value = qty;
-            
-            document.getElementById('equipment-update-card').scrollIntoView({ behavior: 'smooth' });
-        }
-
-        function addItemRow() {
-            var container = document.getElementById('items-container');
-            var rows = container.querySelectorAll('.item-row');
-            var clone = rows[rows.length - 1].cloneNode(true);
-            clone.querySelector('select[name="equipment_id[]"]').value = '';
-            clone.querySelector('input[name="quantity[]"]').value = '1';
-            container.appendChild(clone);
-        }
-
-        function removeItemRow(btn) {
-            var container = document.getElementById('items-container');
-            var rows = container.querySelectorAll('.item-row');
-            if (rows.length <= 1) {
-                return; // keep at least one item row
-            }
-            btn.closest('.item-row').remove();
-        }
-    </script>
+    <script src="wk5_database2.js"></script>
 </body>
 </html>
