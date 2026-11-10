@@ -169,11 +169,22 @@ try {
                     EXECUTE format('ALTER TABLE borrow_transactions DROP CONSTRAINT %I', transaction_status_constraint.conname);
                 END LOOP;
             END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'equipment'::regclass
+                  AND conname = 'equipment_equipment_name_key'
+                  AND contype = 'u'
+            ) THEN
+                ALTER TABLE equipment
+                ADD CONSTRAINT equipment_equipment_name_key UNIQUE (equipment_name);
+            END IF;
         END
         \$migration\$;
     ");
 } catch (Throwable $e) {
-    error_log('Borrower or transaction constraint migration failed: ' . $e->getMessage());
+    error_log('Borrower, transaction, or equipment constraint migration failed: ' . $e->getMessage());
     http_response_code(503);
     exit('Database schema setup failed. Check the application error log.');
 }
@@ -353,6 +364,10 @@ function friendlyError(Throwable $e): string {
         '22007' => 'Invalid date format.',
     ];
     $code = $e->getCode();
+    if ($code === '23505' && $e instanceof PDOException
+        && preg_match('/unique constraint "equipment_equipment_name_key"/i', $e->getMessage())) {
+        return 'An equipment item with this name already exists. Choose a different name.';
+    }
     if ($code === '23514' && $e instanceof PDOException
         && preg_match('/violates check constraint "([^"]+)"/i', $e->getMessage(), $matches)) {
         return $map[$code] . ' Database rule: ' . $matches[1] . '.';
@@ -1752,6 +1767,26 @@ $summary_records = $pdo->query("
             <p class="report-note">Register at least one borrower and add equipment before creating a transaction.</p>
         <?php endif; ?>
     </div>
+
+    <div class="card">
+        <h2>Transaction Management Check</h2>
+        <p class="report-note">Create, update, and delete workflows run related header/item writes inside a database transaction, committing only after all writes succeed and rolling back on errors. The check below forces an invalid item insert after a temporary header insert, then verifies the header was rolled back. All test work is rolled back and no borrowing data is retained.</p>
+        <?php if ($transaction_rollback_test !== null): ?>
+        <table>
+            <thead><tr><th>Test Scenario</th><th>Expected Behavior</th><th>Observed Result</th><th>Result</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td>Failed multi-step borrowing transaction</td>
+                    <td><?= htmlspecialchars($transaction_rollback_test['expected'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($transaction_rollback_test['observed'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><span class="badge <?= $transaction_rollback_test['passed'] ? 'badge-ontime' : 'badge-overdue' ?>"><?= $transaction_rollback_test['passed'] ? 'PASS' : 'FAIL' ?></span></td>
+                </tr>
+            </tbody>
+        </table>
+        <?php else: ?>
+            <p class="report-note">Rollback test unavailable because no borrower and equipment records are available.</p>
+        <?php endif; ?>
+    </div>
     </section>
 
     <section class="module-panel" id="module-borrowers" role="tabpanel" aria-labelledby="tab-borrowers" data-module-panel="borrowers" hidden>
@@ -2413,26 +2448,6 @@ $summary_records = $pdo->query("
         </table>
         <?php else: ?>
             <p class="report-note">Self-tests unavailable — the integration checks require a registered borrower and at least one equipment item with two or more units available.</p>
-        <?php endif; ?>
-    </div>
-
-    <div class="card">
-        <h2>Transaction Management Check</h2>
-        <p class="report-note">Create, update, and delete workflows run related header/item writes inside a database transaction, committing only after all writes succeed and rolling back on errors. The check below forces an invalid item insert after a temporary header insert, then verifies the header was rolled back. All test work is rolled back and no borrowing data is retained.</p>
-        <?php if ($transaction_rollback_test !== null): ?>
-        <table>
-            <thead><tr><th>Test Scenario</th><th>Expected Behavior</th><th>Observed Result</th><th>Result</th></tr></thead>
-            <tbody>
-                <tr>
-                    <td>Failed multi-step borrowing transaction</td>
-                    <td><?= htmlspecialchars($transaction_rollback_test['expected'], ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars($transaction_rollback_test['observed'], ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><span class="badge <?= $transaction_rollback_test['passed'] ? 'badge-ontime' : 'badge-overdue' ?>"><?= $transaction_rollback_test['passed'] ? 'PASS' : 'FAIL' ?></span></td>
-                </tr>
-            </tbody>
-        </table>
-        <?php else: ?>
-            <p class="report-note">Rollback test unavailable because no borrower and equipment records are available.</p>
         <?php endif; ?>
     </div>
 
