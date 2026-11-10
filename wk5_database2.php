@@ -929,7 +929,16 @@ try {
 }
 
 // FETCH EQUIPMENT FOR DROPDOWN & TABLE
-$equipment_list = $pdo->query('SELECT equipment_id, property_no, equipment_name, category, quantity_available FROM equipment ORDER BY equipment_name')->fetchAll(PDO::FETCH_ASSOC);
+$equipment_list = $pdo->query("
+    SELECT equipment_id, property_no, equipment_name, category, quantity_available,
+           CASE
+               WHEN quantity_available > 5 THEN 'Available'
+               WHEN quantity_available BETWEEN 1 AND 5 THEN 'Low Stock'
+               ELSE 'Out of Stock'
+           END AS availability_status
+    FROM equipment
+    ORDER BY equipment_name
+")->fetchAll(PDO::FETCH_ASSOC);
 $borrower_list = $pdo->query('SELECT borrower_id, borrower_no, full_name, borrower_type, email FROM borrowers ORDER BY borrower_no')->fetchAll(PDO::FETCH_ASSOC);
 $transactions = $pdo->query("
     SELECT bt.borrow_id, bt.borrower_id, b.borrower_no, b.full_name, bt.borrow_date, bt.due_date, bt.status
@@ -2034,12 +2043,13 @@ $summary_records = $pdo->query("
                     <th>Name</th>
                     <th>Category</th>
                     <th>Qty Available</th>
+                    <th>Stock Status</th>
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
                 <?php if (!$equipment_list): ?>
-                    <tr><td colspan="6">No equipment has been added yet.</td></tr>
+                    <tr><td colspan="7">No equipment has been added yet.</td></tr>
                 <?php endif; ?>
                 <?php foreach ($equipment_list as $eq): ?>
                 <tr>
@@ -2048,6 +2058,7 @@ $summary_records = $pdo->query("
                     <td><?= htmlspecialchars($eq['equipment_name'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= htmlspecialchars($eq['category'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= (int)$eq['quantity_available'] ?></td>
+                    <td><?= htmlspecialchars($eq['availability_status'], ENT_QUOTES, 'UTF-8') ?></td>
                     <td>
                         <div class="action-group">
                             <button type="button" class="btn-edit" 
