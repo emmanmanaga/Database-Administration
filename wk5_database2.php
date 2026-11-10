@@ -170,16 +170,18 @@ try {
                 END LOOP;
             END IF;
 
-            IF NOT EXISTS (
+            IF EXISTS (
                 SELECT 1
                 FROM pg_constraint
                 WHERE conrelid = 'equipment'::regclass
                   AND conname = 'equipment_equipment_name_key'
                   AND contype = 'u'
             ) THEN
-                ALTER TABLE equipment
-                ADD CONSTRAINT equipment_equipment_name_key UNIQUE (equipment_name);
+                ALTER TABLE equipment DROP CONSTRAINT equipment_equipment_name_key;
             END IF;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS equipment_equipment_name_lower_key
+            ON equipment (lower(equipment_name));
         END
         \$migration\$;
     ");
@@ -365,7 +367,7 @@ function friendlyError(Throwable $e): string {
     ];
     $code = $e->getCode();
     if ($code === '23505' && $e instanceof PDOException
-        && preg_match('/unique constraint "equipment_equipment_name_key"/i', $e->getMessage())) {
+        && preg_match('/unique constraint "equipment_equipment_name_lower_key"/i', $e->getMessage())) {
         return 'An equipment item with this name already exists. Choose a different name.';
     }
     if ($code === '23514' && $e instanceof PDOException
