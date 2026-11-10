@@ -68,22 +68,31 @@ try {
         DO \$migration\$
         DECLARE
             borrower_type_constraint RECORD;
+            transaction_status_constraint RECORD;
         BEGIN
             IF NOT EXISTS (
                 SELECT 1
                 FROM pg_constraint
                 WHERE conrelid = 'borrowers'::regclass
                   AND conname = 'borrowers_borrower_type_allowed_check'
+                  AND position('student' IN pg_get_constraintdef(oid)) > 0
+                  AND position('faculty' IN pg_get_constraintdef(oid)) > 0
+                  AND position('staff' IN pg_get_constraintdef(oid)) > 0
             ) THEN
                 FOR borrower_type_constraint IN
                     SELECT conname
                     FROM pg_constraint
                     WHERE conrelid = 'borrowers'::regclass
                       AND contype = 'c'
-                      AND pg_get_constraintdef(oid) ILIKE '%borrower_type%'
-                      AND pg_get_constraintdef(oid) ILIKE '%student%'
-                      AND pg_get_constraintdef(oid) ILIKE '%faculty%'
-                      AND pg_get_constraintdef(oid) ILIKE '%staff%'
+                      AND (
+                          conname = 'borrowers_borrower_type_allowed_check'
+                          OR (
+                              pg_get_constraintdef(oid) ILIKE '%borrower_type%'
+                              AND pg_get_constraintdef(oid) ILIKE '%student%'
+                              AND pg_get_constraintdef(oid) ILIKE '%faculty%'
+                              AND pg_get_constraintdef(oid) ILIKE '%staff%'
+                          )
+                      )
                 LOOP
                     EXECUTE format('ALTER TABLE borrowers DROP CONSTRAINT %I', borrower_type_constraint.conname);
                 END LOOP;
@@ -91,19 +100,82 @@ try {
                 UPDATE borrowers
                 SET borrower_type = lower(btrim(borrower_type))
                 WHERE borrower_type IS NOT NULL
+                  AND lower(btrim(borrower_type)) IN ('student', 'faculty', 'staff')
                   AND borrower_type IS DISTINCT FROM lower(btrim(borrower_type));
 
                 ALTER TABLE borrowers
                 ADD CONSTRAINT borrowers_borrower_type_allowed_check
                 CHECK (borrower_type IN ('student', 'faculty', 'staff'));
+            ELSE
+                FOR borrower_type_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'borrowers'::regclass
+                      AND contype = 'c'
+                      AND conname <> 'borrowers_borrower_type_allowed_check'
+                      AND pg_get_constraintdef(oid) ILIKE '%borrower_type%'
+                      AND pg_get_constraintdef(oid) ILIKE '%student%'
+                      AND pg_get_constraintdef(oid) ILIKE '%faculty%'
+                      AND pg_get_constraintdef(oid) ILIKE '%staff%'
+                LOOP
+                    EXECUTE format('ALTER TABLE borrowers DROP CONSTRAINT %I', borrower_type_constraint.conname);
+                END LOOP;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'borrow_transactions'::regclass
+                  AND conname = 'borrow_transactions_status_allowed_check'
+                  AND position('lower' IN pg_get_constraintdef(oid)) > 0
+                  AND position('pending' IN pg_get_constraintdef(oid)) > 0
+                  AND position('borrowed' IN pg_get_constraintdef(oid)) > 0
+                  AND position('returned' IN pg_get_constraintdef(oid)) > 0
+                  AND position('overdue' IN pg_get_constraintdef(oid)) > 0
+            ) THEN
+                FOR transaction_status_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'borrow_transactions'::regclass
+                      AND contype = 'c'
+                      AND (
+                          conname = 'borrow_transactions_status_allowed_check'
+                          OR (
+                              pg_get_constraintdef(oid) ILIKE '%status%'
+                              AND pg_get_constraintdef(oid) ILIKE '%borrowed%'
+                              AND pg_get_constraintdef(oid) ILIKE '%returned%'
+                              AND pg_get_constraintdef(oid) ILIKE '%overdue%'
+                          )
+                      )
+                LOOP
+                    EXECUTE format('ALTER TABLE borrow_transactions DROP CONSTRAINT %I', transaction_status_constraint.conname);
+                END LOOP;
+
+                ALTER TABLE borrow_transactions
+                ADD CONSTRAINT borrow_transactions_status_allowed_check
+                CHECK (lower(btrim(status)) IN ('pending', 'borrowed', 'returned', 'overdue'));
+            ELSE
+                FOR transaction_status_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'borrow_transactions'::regclass
+                      AND contype = 'c'
+                      AND conname <> 'borrow_transactions_status_allowed_check'
+                      AND pg_get_constraintdef(oid) ILIKE '%status%'
+                      AND pg_get_constraintdef(oid) ILIKE '%borrowed%'
+                      AND pg_get_constraintdef(oid) ILIKE '%returned%'
+                      AND pg_get_constraintdef(oid) ILIKE '%overdue%'
+                LOOP
+                    EXECUTE format('ALTER TABLE borrow_transactions DROP CONSTRAINT %I', transaction_status_constraint.conname);
+                END LOOP;
             END IF;
         END
         \$migration\$;
     ");
 } catch (Throwable $e) {
-    error_log('Borrower type constraint migration failed: ' . $e->getMessage());
+    error_log('Borrower or transaction constraint migration failed: ' . $e->getMessage());
     http_response_code(503);
-    exit('Borrower database setup failed. Check the application error log.');
+    exit('Database schema setup failed. Check the application error log.');
 }
 
 function postText(string $key, string $label, int $maxLength): string {
@@ -281,6 +353,10 @@ function friendlyError(Throwable $e): string {
         '22007' => 'Invalid date format.',
     ];
     $code = $e->getCode();
+    if ($code === '23514' && $e instanceof PDOException
+        && preg_match('/violates check constraint "([^"]+)"/i', $e->getMessage(), $matches)) {
+        return $map[$code] . ' Database rule: ' . $matches[1] . '.';
+    }
     if (isset($map[$code])) {
         return $map[$code];
     }
@@ -648,8 +724,10 @@ try {
         LEFT JOIN borrow_items bi ON e.equipment_id = bi.equipment_id
         GROUP BY e.equipment_id, e.property_no, e.equipment_name
     ");
-} catch (Exception $e) {
+} catch (Throwable $e) {
     error_log('Borrowing system view setup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit('Borrowing system database setup failed. Check the application error log.');
 }
 
 // WEEK 10 POSTGRESQL DATABASE OBJECTS (Functions, Triggers, Audit)
@@ -699,7 +777,7 @@ try {
             IF (TG_OP = 'UPDATE' AND OLD.equipment_id = NEW.equipment_id) THEN
                 v_already_held := OLD.quantity;
             END IF;
-            IF v_status IN ('borrowed', 'overdue')
+            IF lower(v_status) IN ('borrowed', 'overdue')
                AND NEW.quantity > v_available_qty + v_already_held THEN
                 RAISE EXCEPTION 'Requested quantity (%) exceeds available stock (%)', NEW.quantity, v_available_qty + v_already_held;
             END IF;
@@ -768,19 +846,19 @@ try {
         BEGIN
             IF (TG_OP = 'INSERT') THEN
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = NEW.borrow_id;
-                IF v_status IN ('borrowed', 'overdue') THEN
+                IF lower(v_status) IN ('borrowed', 'overdue') THEN
                     UPDATE equipment SET quantity_available = quantity_available - NEW.quantity WHERE equipment_id = NEW.equipment_id;
                 END IF;
             ELSIF (TG_OP = 'DELETE') THEN
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = OLD.borrow_id;
-                IF v_status IN ('borrowed', 'overdue') THEN
+                IF lower(v_status) IN ('borrowed', 'overdue') THEN
                     UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
                 END IF;
             ELSIF (TG_OP = 'UPDATE') THEN
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = OLD.borrow_id;
-                v_old_active := v_status IN ('borrowed', 'overdue');
+                v_old_active := lower(v_status) IN ('borrowed', 'overdue');
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = NEW.borrow_id;
-                v_new_active := v_status IN ('borrowed', 'overdue');
+                v_new_active := lower(v_status) IN ('borrowed', 'overdue');
                 IF v_old_active THEN
                     UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
                 END IF;
@@ -802,8 +880,8 @@ try {
         DECLARE
             v_item RECORD;
         BEGIN
-            IF OLD.status IN ('borrowed', 'overdue')
-               AND NEW.status NOT IN ('borrowed', 'overdue') THEN
+            IF lower(OLD.status) IN ('borrowed', 'overdue')
+               AND lower(NEW.status) NOT IN ('borrowed', 'overdue') THEN
                 FOR v_item IN
                     SELECT equipment_id, SUM(quantity)::INT AS quantity
                     FROM borrow_items
@@ -815,8 +893,8 @@ try {
                     SET quantity_available = quantity_available + v_item.quantity
                     WHERE equipment_id = v_item.equipment_id;
                 END LOOP;
-            ELSIF OLD.status NOT IN ('borrowed', 'overdue')
-                  AND NEW.status IN ('borrowed', 'overdue') THEN
+            ELSIF lower(OLD.status) NOT IN ('borrowed', 'overdue')
+                  AND lower(NEW.status) IN ('borrowed', 'overdue') THEN
                 FOR v_item IN
                     SELECT equipment_id, SUM(quantity)::INT AS quantity
                     FROM borrow_items
@@ -844,8 +922,10 @@ try {
         WHEN (OLD.status IS DISTINCT FROM NEW.status)
         EXECUTE FUNCTION fn_sync_equipment_stock_on_status_change();
     ");
-} catch (Exception $e) {
+} catch (Throwable $e) {
     error_log('Borrowing system database object setup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit('Borrowing system database setup failed. Check the application error log.');
 }
 
 // FETCH EQUIPMENT FOR DROPDOWN & TABLE
@@ -900,8 +980,8 @@ $monthly_report = $pdo->query("
         EXTRACT(YEAR FROM DATE_TRUNC('month', bt.borrow_date))::int AS yr,
         TO_CHAR(DATE_TRUNC('month', bt.borrow_date), 'Mon YYYY') AS month_label,
         COUNT(*) AS total_borrows,
-        COUNT(*) FILTER (WHERE bt.status = 'returned') AS returned_count,
-        COUNT(*) FILTER (WHERE bt.status IN ('borrowed', 'overdue')) AS active_count
+        COUNT(*) FILTER (WHERE lower(bt.status) = 'returned') AS returned_count,
+        COUNT(*) FILTER (WHERE lower(bt.status) IN ('borrowed', 'overdue')) AS active_count
     FROM borrow_transactions bt
     GROUP BY DATE_TRUNC('month', bt.borrow_date)
     ORDER BY DATE_TRUNC('month', bt.borrow_date) DESC
@@ -952,7 +1032,7 @@ $case_classification_tests = $pdo->query("
 $status_summary = $pdo->query("
     SELECT statuses.status, COUNT(bt.borrow_id) AS total
     FROM (VALUES ('borrowed'), ('returned'), ('overdue')) AS statuses(status)
-    LEFT JOIN borrow_transactions bt ON bt.status = statuses.status
+    LEFT JOIN borrow_transactions bt ON lower(bt.status) = statuses.status
     GROUP BY statuses.status
     ORDER BY CASE statuses.status
         WHEN 'borrowed' THEN 1
@@ -1003,12 +1083,12 @@ $equip_aggregates = $pdo->query("
 $activity_union_all = $pdo->query("
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
     UNION ALL
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
-      AND (bt.status = 'overdue' OR bt.due_date < CURRENT_DATE)
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
+      AND (lower(bt.status) = 'overdue' OR bt.due_date < CURRENT_DATE)
     ORDER BY borrower_no, borrower
 ")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1016,12 +1096,12 @@ $activity_union_all = $pdo->query("
 $activity_union = $pdo->query("
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
     UNION
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
-      AND (bt.status = 'overdue' OR bt.due_date < CURRENT_DATE)
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
+      AND (lower(bt.status) = 'overdue' OR bt.due_date < CURRENT_DATE)
     ORDER BY borrower_no, borrower
 ")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1405,8 +1485,8 @@ $query = "
         bt.due_date,
         ABS(CURRENT_DATE - bt.due_date) AS days_difference,
         CASE
-            WHEN bt.status = 'overdue'
-              OR (bt.status = 'borrowed' AND bt.due_date < CURRENT_DATE) THEN 'Overdue'
+            WHEN lower(bt.status) = 'overdue'
+              OR (lower(bt.status) = 'borrowed' AND bt.due_date < CURRENT_DATE) THEN 'Overdue'
             ELSE INITCAP(COALESCE(bt.status, 'not borrowed'))
         END AS status_check
     FROM borrowers b
@@ -1427,9 +1507,9 @@ if ($filter_type !== '') {
 }
 if ($filter_status !== '') {
     if ($filter_status === 'overdue') {
-        $conditions[] = "(bt.status = 'overdue' OR (bt.status = 'borrowed' AND bt.due_date < CURRENT_DATE))";
+        $conditions[] = "(lower(bt.status) = 'overdue' OR (lower(bt.status) = 'borrowed' AND bt.due_date < CURRENT_DATE))";
     } else {
-        $conditions[] = 'bt.status = :status';
+        $conditions[] = 'lower(bt.status) = :status';
         $params[':status'] = $filter_status;
     }
 }
@@ -1457,22 +1537,22 @@ $records = $stmt->fetchAll(PDO::FETCH_ASSOC);
 $kpi = $pdo->query("
     SELECT
         (SELECT COUNT(*) FROM borrowers) AS total_borrowers,
-        (SELECT COUNT(*) FROM borrow_transactions WHERE status IN ('borrowed', 'overdue')) AS active_borrowings,
+        (SELECT COUNT(*) FROM borrow_transactions WHERE lower(status) IN ('borrowed', 'overdue')) AS active_borrowings,
         (SELECT COALESCE(SUM(bi.quantity), 0)
            FROM borrow_items bi
            JOIN borrow_transactions bt ON bt.borrow_id = bi.borrow_id
-          WHERE bt.status IN ('borrowed', 'overdue')) AS items_out,
+          WHERE lower(bt.status) IN ('borrowed', 'overdue')) AS items_out,
         (SELECT COUNT(*) FROM borrow_transactions
-          WHERE status IN ('borrowed', 'overdue') AND (status = 'overdue' OR due_date < CURRENT_DATE)) AS overdue
+          WHERE lower(status) IN ('borrowed', 'overdue') AND (lower(status) = 'overdue' OR due_date < CURRENT_DATE)) AS overdue
 ")->fetch(PDO::FETCH_ASSOC);
 
 $summary_records = $pdo->query("
     SELECT
         borrower_types.borrower_type,
         COUNT(DISTINCT b.borrower_id) AS borrowers,
-        COUNT(DISTINCT CASE WHEN bt.status IN ('borrowed', 'overdue') THEN bt.borrow_id END) AS borrowings,
-        COALESCE(SUM(CASE WHEN bt.status IN ('borrowed', 'overdue') THEN bi.quantity ELSE 0 END), 0) AS items,
-        COUNT(DISTINCT CASE WHEN bt.status IN ('borrowed', 'overdue') AND (bt.status = 'overdue' OR bt.due_date < CURRENT_DATE) THEN bt.borrow_id END) AS overdue
+        COUNT(DISTINCT CASE WHEN lower(bt.status) IN ('borrowed', 'overdue') THEN bt.borrow_id END) AS borrowings,
+        COALESCE(SUM(CASE WHEN lower(bt.status) IN ('borrowed', 'overdue') THEN bi.quantity ELSE 0 END), 0) AS items,
+        COUNT(DISTINCT CASE WHEN lower(bt.status) IN ('borrowed', 'overdue') AND (lower(bt.status) = 'overdue' OR bt.due_date < CURRENT_DATE) THEN bt.borrow_id END) AS overdue
     FROM (VALUES ('student'), ('faculty'), ('staff')) AS borrower_types(borrower_type)
     LEFT JOIN borrowers b ON b.borrower_type = borrower_types.borrower_type
     LEFT JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
