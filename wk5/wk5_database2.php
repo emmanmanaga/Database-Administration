@@ -5,7 +5,7 @@ $host     = 'localhost';
 $port     = '5432';
 $dbname   = 'postgres';
 $user     = 'postgres';
-$password = 'ILoveAcheron_1';
+$password = 'woshidaxuesheng';
 
 // Demonstration operator label recorded by the Week 10 audit trigger (see fn_borrow_items_audit).
 $actor = 'postgre';
