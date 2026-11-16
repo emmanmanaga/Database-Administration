@@ -1,11 +1,11 @@
 <?php
 session_start();
 
-$host     = '192.168.137.1';
+$host     = 'localhost';
 $port     = '5432';
 $dbname   = 'postgres';
 $user     = 'postgres';
-$password = 'maura';
+$password = 'woshidaxuesheng';
 
 // Demonstration operator label recorded by the Week 10 audit trigger (see fn_borrow_items_audit).
 $actor = 'postgre';
@@ -56,6 +56,17 @@ try {
 }
 
 $is_local_database = in_array(strtolower(trim($host)), ['localhost', '127.0.0.1', '::1'], true);
+
+function borrowerDisplayName($full_name): string {
+    $name = trim((string)($full_name ?? ''));
+    if ($name === '') {
+        return '';
+    }
+    if (function_exists('mb_strtoupper')) {
+        return mb_strtoupper($name, 'UTF-8');
+    }
+    return strtoupper($name);
+}
 
 function redirectWithFlash(string $message, string $type = 'success'): void {
     $_SESSION['flash'] = ['msg' => $message, 'type' => $type];
@@ -956,7 +967,7 @@ $equipment_list = $pdo->query("
     FROM equipment
     ORDER BY equipment_name
 ")->fetchAll(PDO::FETCH_ASSOC);
-$borrower_list = $pdo->query('SELECT borrower_id, borrower_no, full_name, borrower_type, email FROM borrowers ORDER BY borrower_no')->fetchAll(PDO::FETCH_ASSOC);
+$borrower_list = $pdo->query('SELECT borrower_id, borrower_no, UPPER(TRIM(full_name)) AS full_name, borrower_type, email FROM borrowers ORDER BY borrower_no')->fetchAll(PDO::FETCH_ASSOC);
 $transactions = $pdo->query("
     SELECT bt.borrow_id, bt.borrower_id, b.borrower_no, b.full_name, bt.borrow_date, bt.due_date, bt.status
     FROM borrow_transactions bt
@@ -1729,7 +1740,7 @@ $summary_records = $pdo->query("
                 <select name="borrower_id" required>
                     <option value="">-- Select Borrower --</option>
                     <?php foreach ($borrower_list as $borrower): ?>
-                        <option value="<?= (int)$borrower['borrower_id'] ?>"><?= htmlspecialchars($borrower['borrower_no'] . ' — ' . $borrower['full_name'], ENT_QUOTES, 'UTF-8') ?></option>
+                        <option value="<?= (int)$borrower['borrower_id'] ?>"><?= htmlspecialchars($borrower['borrower_no'] . ' — ' . borrowerDisplayName($borrower['full_name']), ENT_QUOTES, 'UTF-8') ?></option>
                     <?php endforeach; ?>
                 </select>
                 </label>
@@ -1833,13 +1844,13 @@ $summary_records = $pdo->query("
                 <tr>
                     <td><?= (int)$borrower['borrower_id'] ?></td>
                     <td><?= htmlspecialchars($borrower['borrower_no'], ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars($borrower['full_name'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars(borrowerDisplayName($borrower['full_name']), ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= htmlspecialchars(ucfirst($borrower['borrower_type']), ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= htmlspecialchars($borrower['email'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td>
                         <div class="action-group">
                             <button type="button" class="btn-edit"
-                                onclick='fillBorrowerUpdate(<?= json_encode((int)$borrower['borrower_id']) ?>, <?= json_encode($borrower['borrower_no'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['full_name'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['borrower_type'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['email'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>)'>
+                                onclick='fillBorrowerUpdate(<?= json_encode((int)$borrower['borrower_id']) ?>, <?= json_encode($borrower['borrower_no'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode(borrowerDisplayName($borrower['full_name']), JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['borrower_type'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['email'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>)'>
                                 Edit
                             </button>
                             <form method="post" class="inline-form">
