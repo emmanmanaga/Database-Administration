@@ -1,16 +1,28 @@
 <?php
 session_start();
 
-$host     = 'localhost';
-$port     = '5432';
-$dbname   = 'postgres';
-$user     = 'postgres';
-$password = 'ILoveAcheron_1';
+$localConfigPath = __DIR__ . DIRECTORY_SEPARATOR . 'db.local.php';
+$localDatabaseConfig = [];
+if (is_file($localConfigPath)) {
+    $loadedDatabaseConfig = require $localConfigPath;
+    if (is_array($loadedDatabaseConfig)) {
+        $localDatabaseConfig = $loadedDatabaseConfig;
+    }
+}
+
+$host     = getenv('DB_HOST') ?: (string)($localDatabaseConfig['host'] ?? 'localhost');
+$port     = getenv('DB_PORT') ?: (string)($localDatabaseConfig['port'] ?? '5432');
+$dbname   = getenv('DB_NAME') ?: (string)($localDatabaseConfig['dbname'] ?? 'postgres');
+$user     = getenv('DB_USER') ?: (string)($localDatabaseConfig['user'] ?? 'postgres');
+$password = getenv('DB_PASSWORD') ?: (string)($localDatabaseConfig['password'] ?? '');
 
 // Demonstration operator label recorded by the Week 10 audit trigger (see fn_borrow_items_audit).
 $actor = 'postgre';
 
 try {
+    if ($password === '') {
+        throw new RuntimeException('Set DB_PASSWORD or configure a local db.local.php file.');
+    }
     $pdo = new PDO("pgsql:host=$host;port=$port;dbname=$dbname;connect_timeout=5", $user, $password);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $connection_info = $pdo->query("
@@ -54,10 +66,149 @@ try {
 
 $is_local_database = in_array(strtolower(trim($host)), ['localhost', '127.0.0.1', '::1'], true);
 
+function borrowerDisplayName($full_name): string {
+    $name = trim((string)($full_name ?? ''));
+    if ($name === '') {
+        return '';
+    }
+    if (function_exists('mb_strtoupper')) {
+        return mb_strtoupper($name, 'UTF-8');
+    }
+    return strtoupper($name);
+}
+
 function redirectWithFlash(string $message, string $type = 'success'): void {
     $_SESSION['flash'] = ['msg' => $message, 'type' => $type];
     header('Location: ' . ($_SERVER['PHP_SELF'] ?? '/'));
     exit;
+}
+
+try {
+    $pdo->exec("
+        DO \$migration\$
+        DECLARE
+            borrower_type_constraint RECORD;
+            transaction_status_constraint RECORD;
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'borrowers'::regclass
+                  AND conname = 'borrowers_borrower_type_allowed_check'
+                  AND position('student' IN pg_get_constraintdef(oid)) > 0
+                  AND position('faculty' IN pg_get_constraintdef(oid)) > 0
+                  AND position('staff' IN pg_get_constraintdef(oid)) > 0
+            ) THEN
+                FOR borrower_type_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'borrowers'::regclass
+                      AND contype = 'c'
+                      AND (
+                          conname = 'borrowers_borrower_type_allowed_check'
+                          OR (
+                              pg_get_constraintdef(oid) ILIKE '%borrower_type%'
+                              AND pg_get_constraintdef(oid) ILIKE '%student%'
+                              AND pg_get_constraintdef(oid) ILIKE '%faculty%'
+                              AND pg_get_constraintdef(oid) ILIKE '%staff%'
+                          )
+                      )
+                LOOP
+                    EXECUTE format('ALTER TABLE borrowers DROP CONSTRAINT %I', borrower_type_constraint.conname);
+                END LOOP;
+
+                UPDATE borrowers
+                SET borrower_type = lower(btrim(borrower_type))
+                WHERE borrower_type IS NOT NULL
+                  AND lower(btrim(borrower_type)) IN ('student', 'faculty', 'staff')
+                  AND borrower_type IS DISTINCT FROM lower(btrim(borrower_type));
+
+                ALTER TABLE borrowers
+                ADD CONSTRAINT borrowers_borrower_type_allowed_check
+                CHECK (borrower_type IN ('student', 'faculty', 'staff'));
+            ELSE
+                FOR borrower_type_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'borrowers'::regclass
+                      AND contype = 'c'
+                      AND conname <> 'borrowers_borrower_type_allowed_check'
+                      AND pg_get_constraintdef(oid) ILIKE '%borrower_type%'
+                      AND pg_get_constraintdef(oid) ILIKE '%student%'
+                      AND pg_get_constraintdef(oid) ILIKE '%faculty%'
+                      AND pg_get_constraintdef(oid) ILIKE '%staff%'
+                LOOP
+                    EXECUTE format('ALTER TABLE borrowers DROP CONSTRAINT %I', borrower_type_constraint.conname);
+                END LOOP;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'borrow_transactions'::regclass
+                  AND conname = 'borrow_transactions_status_allowed_check'
+                  AND position('lower' IN pg_get_constraintdef(oid)) > 0
+                  AND position('pending' IN pg_get_constraintdef(oid)) > 0
+                  AND position('borrowed' IN pg_get_constraintdef(oid)) > 0
+                  AND position('returned' IN pg_get_constraintdef(oid)) > 0
+                  AND position('overdue' IN pg_get_constraintdef(oid)) > 0
+            ) THEN
+                FOR transaction_status_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'borrow_transactions'::regclass
+                      AND contype = 'c'
+                      AND (
+                          conname = 'borrow_transactions_status_allowed_check'
+                          OR (
+                              pg_get_constraintdef(oid) ILIKE '%status%'
+                              AND pg_get_constraintdef(oid) ILIKE '%borrowed%'
+                              AND pg_get_constraintdef(oid) ILIKE '%returned%'
+                              AND pg_get_constraintdef(oid) ILIKE '%overdue%'
+                          )
+                      )
+                LOOP
+                    EXECUTE format('ALTER TABLE borrow_transactions DROP CONSTRAINT %I', transaction_status_constraint.conname);
+                END LOOP;
+
+                ALTER TABLE borrow_transactions
+                ADD CONSTRAINT borrow_transactions_status_allowed_check
+                CHECK (lower(btrim(status)) IN ('pending', 'borrowed', 'returned', 'overdue'));
+            ELSE
+                FOR transaction_status_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'borrow_transactions'::regclass
+                      AND contype = 'c'
+                      AND conname <> 'borrow_transactions_status_allowed_check'
+                      AND pg_get_constraintdef(oid) ILIKE '%status%'
+                      AND pg_get_constraintdef(oid) ILIKE '%borrowed%'
+                      AND pg_get_constraintdef(oid) ILIKE '%returned%'
+                      AND pg_get_constraintdef(oid) ILIKE '%overdue%'
+                LOOP
+                    EXECUTE format('ALTER TABLE borrow_transactions DROP CONSTRAINT %I', transaction_status_constraint.conname);
+                END LOOP;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'equipment'::regclass
+                  AND conname = 'equipment_equipment_name_key'
+                  AND contype = 'u'
+            ) THEN
+                ALTER TABLE equipment DROP CONSTRAINT equipment_equipment_name_key;
+            END IF;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS equipment_equipment_name_lower_key
+            ON equipment (lower(equipment_name));
+        END
+        \$migration\$;
+    ");
+} catch (Throwable $e) {
+    error_log('Borrower, transaction, or equipment constraint migration failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit('Database schema setup failed. Check the application error log.');
 }
 
 function postText(string $key, string $label, int $maxLength): string {
@@ -235,6 +386,14 @@ function friendlyError(Throwable $e): string {
         '22007' => 'Invalid date format.',
     ];
     $code = $e->getCode();
+    if ($code === '23505' && $e instanceof PDOException
+        && preg_match('/unique constraint "equipment_equipment_name_lower_key"/i', $e->getMessage())) {
+        return 'An equipment item with this name already exists. Choose a different name.';
+    }
+    if ($code === '23514' && $e instanceof PDOException
+        && preg_match('/violates check constraint "([^"]+)"/i', $e->getMessage(), $matches)) {
+        return $map[$code] . ' Database rule: ' . $matches[1] . '.';
+    }
     if (isset($map[$code])) {
         return $map[$code];
     }
@@ -255,6 +414,255 @@ function friendlyError(Throwable $e): string {
     return 'The operation could not be completed. Please review the information and try again.';
 }
 
+function databaseBackupDirectory(): string {
+    $documentRoot = realpath((string)($_SERVER['DOCUMENT_ROOT'] ?? '')) ?: realpath(__DIR__) ?: __DIR__;
+    $directory = trim((string)(getenv('WK5_BACKUP_DIR') ?: ''));
+    if ($directory === '') {
+        $directory = dirname($documentRoot) . DIRECTORY_SEPARATOR . 'wk5_database_backups';
+    }
+
+    $isAbsolute = DIRECTORY_SEPARATOR === '\\'
+        ? (preg_match('/^[A-Za-z]:[\/\\\\]/', $directory) === 1 || strpos($directory, '\\\\') === 0)
+        : strpos($directory, '/') === 0;
+    if (!$isAbsolute) {
+        throw new RuntimeException('The backup directory must be an absolute path.');
+    }
+
+    if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) {
+        throw new RuntimeException('The backup directory could not be created. Check its parent-folder permissions.');
+    }
+    $realDirectory = realpath($directory);
+    if ($realDirectory === false || !is_writable($realDirectory)) {
+        throw new RuntimeException('The backup directory is not writable by PHP.');
+    }
+
+    $normalizedRoot = rtrim(str_replace('\\', '/', $documentRoot), '/') . '/';
+    $normalizedBackup = rtrim(str_replace('\\', '/', $realDirectory), '/') . '/';
+    $insideWebRoot = DIRECTORY_SEPARATOR === '\\'
+        ? strncasecmp($normalizedBackup, $normalizedRoot, strlen($normalizedRoot)) === 0
+        : strncmp($normalizedBackup, $normalizedRoot, strlen($normalizedRoot)) === 0;
+    if ($insideWebRoot) {
+        throw new RuntimeException('Backups must be stored outside the public web directory.');
+    }
+
+    return $realDirectory;
+}
+
+function findPostgresUtility(string $utility): string {
+    $environmentKey = strtoupper(str_replace('-', '_', $utility)) . '_PATH';
+    $configuredPath = getenv($environmentKey);
+    if (is_string($configuredPath) && $configuredPath !== '' && is_file($configuredPath)) {
+        return $configuredPath;
+    }
+
+    $binaryName = $utility . (DIRECTORY_SEPARATOR === '\\' ? '.exe' : '');
+    $binDirectory = getenv('PG_BIN_DIR');
+    $candidates = [];
+    if (is_string($binDirectory) && $binDirectory !== '') {
+        $candidates[] = rtrim($binDirectory, '\\/') . DIRECTORY_SEPARATOR . $binaryName;
+    }
+    foreach (explode(PATH_SEPARATOR, (string)getenv('PATH')) as $pathEntry) {
+        if ($pathEntry !== '') {
+            $candidates[] = rtrim($pathEntry, '\\/') . DIRECTORY_SEPARATOR . $binaryName;
+        }
+    }
+
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $programFiles = getenv('ProgramFiles') ?: 'C:\\Program Files';
+        $installed = glob(
+            rtrim($programFiles, '\\/') . DIRECTORY_SEPARATOR . 'PostgreSQL' .
+            DIRECTORY_SEPARATOR . '*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $binaryName
+        ) ?: [];
+        usort($installed, static fn(string $a, string $b): int => strnatcasecmp($b, $a));
+        $candidates = array_merge($candidates, $installed);
+    }
+
+    foreach ($candidates as $candidate) {
+        if (is_file($candidate)) {
+            return $candidate;
+        }
+    }
+
+    throw new RuntimeException(
+        $utility . ' was not found. Add PostgreSQL\\bin to PATH or configure ' . $environmentKey . '.'
+    );
+}
+
+function runPostgresUtility(string $binary, array $arguments, string $password = ''): array {
+    if (!function_exists('proc_open')) {
+        throw new RuntimeException('PHP proc_open is disabled, so PostgreSQL backup utilities cannot run.');
+    }
+
+    $environment = getenv();
+    $environment = is_array($environment) ? $environment : [];
+    if ($password !== '') {
+        $environment['PGPASSWORD'] = $password;
+    }
+    $environment['PGCONNECT_TIMEOUT'] = '10';
+
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $process = @proc_open(array_merge([$binary], $arguments), $descriptors, $pipes, null, $environment);
+    if (!is_resource($process)) {
+        throw new RuntimeException('PHP could not start ' . basename($binary) . '.');
+    }
+
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+
+    return [
+        'exit_code' => $exitCode,
+        'stdout' => is_string($stdout) ? $stdout : '',
+        'stderr' => is_string($stderr) ? trim($stderr) : '',
+    ];
+}
+
+function verifyDatabaseBackupArchive(string $archivePath, string $pgRestore): int {
+    $result = runPostgresUtility($pgRestore, ['--list', $archivePath]);
+    $entries = preg_match_all('/^\d+;\s/m', $result['stdout']);
+    if ($result['exit_code'] !== 0 || $entries < 1) {
+        $detail = $result['stderr'] !== '' ? ' ' . substr($result['stderr'], 0, 400) : '';
+        throw new RuntimeException('The backup archive did not pass pg_restore verification.' . $detail);
+    }
+    return $entries;
+}
+
+function createDatabaseBackup(): array {
+    global $host, $port, $dbname, $user, $password;
+
+    $directory = databaseBackupDirectory();
+    $pgDump = findPostgresUtility('pg_dump');
+    $pgRestore = findPostgresUtility('pg_restore');
+    $temporaryPath = tempnam($directory, '.wk5-backup-');
+    if ($temporaryPath === false) {
+        throw new RuntimeException('PHP could not create a temporary backup file.');
+    }
+
+    $filename = 'wk5_database_backup_' . date('Ymd_His') . '_' . bin2hex(random_bytes(4)) . '.dump';
+    $finalPath = $directory . DIRECTORY_SEPARATOR . $filename;
+    try {
+        $result = runPostgresUtility($pgDump, [
+            '--no-password',
+            '--host', $host,
+            '--port', (string)$port,
+            '--username', $user,
+            '--dbname', $dbname,
+            '--format=custom',
+            '--no-owner',
+            '--no-privileges',
+            '--file', $temporaryPath,
+        ], $password);
+        if ($result['exit_code'] !== 0 || !is_file($temporaryPath) || filesize($temporaryPath) < 1) {
+            $detail = $result['stderr'] !== '' ? ' ' . substr($result['stderr'], 0, 400) : '';
+            throw new RuntimeException('pg_dump could not create the database archive.' . $detail);
+        }
+
+        $entryCount = verifyDatabaseBackupArchive($temporaryPath, $pgRestore);
+        if (!@rename($temporaryPath, $finalPath)) {
+            throw new RuntimeException('The verified backup could not be moved into the backup folder.');
+        }
+        $temporaryPath = '';
+        @chmod($finalPath, 0600);
+
+        $fileSize = filesize($finalPath);
+        $sha256 = hash_file('sha256', $finalPath);
+        if ($fileSize === false || $sha256 === false) {
+            throw new RuntimeException('The backup was created, but its verification details could not be read.');
+        }
+
+        return [
+            'state' => 'verified',
+            'file' => $filename,
+            'path' => $finalPath,
+            'size' => $fileSize,
+            'sha256' => $sha256,
+            'toc_entries' => $entryCount,
+            'verified_at' => date(DATE_ATOM),
+        ];
+    } finally {
+        if ($temporaryPath !== '' && is_file($temporaryPath)) {
+            @unlink($temporaryPath);
+        }
+    }
+}
+
+function verifyLatestDatabaseBackup(array $backupStatus): array {
+    $filename = $backupStatus['file'] ?? '';
+    if (!is_string($filename) || !preg_match('/^wk5_database_backup_[0-9]{8}_[0-9]{6}_[a-f0-9]{8}\.dump$/D', $filename)) {
+        throw new RuntimeException('There is no valid backup file available to verify.');
+    }
+
+    $directory = databaseBackupDirectory();
+    $archivePath = $directory . DIRECTORY_SEPARATOR . $filename;
+    if (!is_file($archivePath)) {
+        throw new RuntimeException('The latest backup file is missing from the backup folder.');
+    }
+
+    $pgRestore = findPostgresUtility('pg_restore');
+    $entryCount = verifyDatabaseBackupArchive($archivePath, $pgRestore);
+    $fileSize = filesize($archivePath);
+    $sha256 = hash_file('sha256', $archivePath);
+    if ($fileSize === false || $sha256 === false) {
+        throw new RuntimeException('The backup exists, but its verification details could not be read.');
+    }
+    $expectedHash = $backupStatus['sha256'] ?? '';
+    if (is_string($expectedHash) && $expectedHash !== '' && !hash_equals($expectedHash, $sha256)) {
+        throw new RuntimeException('The backup checksum changed since it was created.');
+    }
+
+    $backupStatus['state'] = 'verified';
+    $backupStatus['path'] = $archivePath;
+    $backupStatus['size'] = $fileSize;
+    $backupStatus['sha256'] = $sha256;
+    $backupStatus['toc_entries'] = $entryCount;
+    $backupStatus['verified_at'] = date(DATE_ATOM);
+    return $backupStatus;
+}
+
+if ($post_action === 'create_database_backup') {
+    try {
+        set_time_limit(0);
+        $backupStatus = createDatabaseBackup();
+        $_SESSION['database_backup_status'] = $backupStatus;
+        redirectWithFlash('Database backup created and verified successfully.');
+    } catch (Throwable $e) {
+        error_log('Database backup failed: ' . $e->getMessage());
+        $_SESSION['database_backup_status'] = [
+            'state' => 'error',
+            'message' => $e->getMessage(),
+            'failed_at' => date(DATE_ATOM),
+        ];
+        redirectWithFlash('Database backup failed: ' . $e->getMessage(), 'error');
+    }
+}
+
+if ($post_action === 'verify_database_backup') {
+    try {
+        set_time_limit(0);
+        $backupStatus = $_SESSION['database_backup_status'] ?? [];
+        if (!is_array($backupStatus)) {
+            $backupStatus = [];
+        }
+        $_SESSION['database_backup_status'] = verifyLatestDatabaseBackup($backupStatus);
+        redirectWithFlash('The latest backup passed pg_restore archive verification.');
+    } catch (Throwable $e) {
+        error_log('Database backup verification failed: ' . $e->getMessage());
+        $_SESSION['database_backup_status'] = [
+            'state' => 'error',
+            'message' => $e->getMessage(),
+            'failed_at' => date(DATE_ATOM),
+        ];
+        redirectWithFlash('Backup verification failed: ' . $e->getMessage(), 'error');
+    }
+}
+
 // CREATE TRANSACTION WITH ONE OR MORE BORROW ITEMS
 if ($post_action === 'create_transaction') {
     try {
@@ -268,16 +676,19 @@ if ($post_action === 'create_transaction') {
         }
 
         $pdo->beginTransaction();
-        $stmtT = $pdo->prepare('INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status) VALUES (:borrower_id, :borrow_date, :due_date, :status) RETURNING borrow_id');
+        $stmtT = $pdo->prepare('CALL sp_insert_transaction(:borrower_id, :borrow_date, :due_date, :status)');
         $stmtT->execute([
             ':borrower_id' => $borrower_id,
             ':borrow_date' => $borrow_date,
-            ':due_date'    => $due_date,
-            ':status'      => $status,
+            ':due_date' => $due_date,
+            ':status' => $status,
         ]);
-        $borrow_id = $stmtT->fetchColumn();
+        $borrow_id = (int)$pdo->query("SELECT currval(pg_get_serial_sequence('borrow_transactions', 'borrow_id'))")->fetchColumn();
+        if ($borrow_id < 1) {
+            throw new RuntimeException('The borrowing transaction was not created.');
+        }
 
-        $stmtI = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, :quantity)');
+        $stmtI = $pdo->prepare('CALL sp_insert_borrow_item(:borrow_id, :equipment_id, :quantity)');
         foreach ($items as $item) {
             $stmtI->execute([
                 ':borrow_id'    => $borrow_id,
@@ -303,7 +714,7 @@ if ($post_action === 'create_borrower') {
         $full_name = postText('full_name', 'Full name', 100);
         $borrower_type = postBorrowerType();
         $email = postOptionalEmail();
-        $stmt = $pdo->prepare('INSERT INTO borrowers (borrower_no, full_name, borrower_type, email) VALUES (:borrower_no, :full_name, :borrower_type, :email)');
+        $stmt = $pdo->prepare('CALL sp_insert_borrower(:borrower_no, :full_name, :borrower_type, :email)');
         $stmt->execute([
             ':borrower_no'   => $borrower_no,
             ':full_name'     => $full_name,
@@ -334,27 +745,20 @@ if ($post_action === 'update_transaction') {
         }
 
         $pdo->beginTransaction();
-        $stmtT = $pdo->prepare('UPDATE borrow_transactions SET borrower_id = :borrower_id, borrow_date = :borrow_date, due_date = :due_date, status = :status WHERE borrow_id = :borrow_id');
+        $stmtT = $pdo->prepare('CALL sp_update_transaction(:borrow_id, :borrower_id, :borrow_date, :due_date, :status)');
         $stmtT->execute([
+            ':borrow_id' => $borrow_id,
             ':borrower_id' => $borrower_id,
             ':borrow_date' => $borrow_date,
             ':due_date' => $due_date,
             ':status' => $status,
-            ':borrow_id' => $borrow_id,
         ]);
-        if ($stmtT->rowCount() === 0) {
-            $stmtExists = $pdo->prepare('SELECT 1 FROM borrow_transactions WHERE borrow_id = :borrow_id');
-            $stmtExists->execute([':borrow_id' => $borrow_id]);
-            if (!$stmtExists->fetchColumn()) {
-                throw new RuntimeException('The selected borrowing transaction no longer exists.');
-            }
-        }
 
         $stmtExisting = $pdo->prepare('SELECT borrow_item_id FROM borrow_items WHERE borrow_id = :borrow_id');
         $stmtExisting->execute([':borrow_id' => $borrow_id]);
         $remaining_item_ids = array_fill_keys(array_map('strval', $stmtExisting->fetchAll(PDO::FETCH_COLUMN)), true);
-        $stmtUpdateItem = $pdo->prepare('UPDATE borrow_items SET equipment_id = :equipment_id, quantity = :quantity WHERE borrow_item_id = :borrow_item_id AND borrow_id = :borrow_id');
-        $stmtInsertItem = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, :quantity)');
+        $stmtUpdateItem = $pdo->prepare('CALL sp_update_borrow_item(:borrow_item_id, :borrow_id, :equipment_id, :quantity)');
+        $stmtInsertItem = $pdo->prepare('CALL sp_insert_borrow_item(:borrow_id, :equipment_id, :quantity)');
 
         foreach ($items as $idx => $item) {
             $raw_item_id = $item_ids[$idx] ?? null;
@@ -379,16 +783,16 @@ if ($post_action === 'update_transaction') {
                 throw new InvalidArgumentException('An item in this transaction was changed or removed. Reload the page and try again.');
             }
             $stmtUpdateItem->execute([
-                ':equipment_id' => $item['equipment_id'],
-                ':quantity' => $item['quantity'],
                 ':borrow_item_id' => (int)$item_id,
                 ':borrow_id' => $borrow_id,
+                ':equipment_id' => $item['equipment_id'],
+                ':quantity' => $item['quantity'],
             ]);
             unset($remaining_item_ids[$item_id]);
         }
 
         if ($remaining_item_ids) {
-            $stmtDeleteItem = $pdo->prepare('DELETE FROM borrow_items WHERE borrow_item_id = :borrow_item_id AND borrow_id = :borrow_id');
+            $stmtDeleteItem = $pdo->prepare('CALL sp_delete_borrow_item(:borrow_item_id, :borrow_id)');
             foreach (array_keys($remaining_item_ids) as $item_id) {
                 $stmtDeleteItem->execute([
                     ':borrow_item_id' => (int)$item_id,
@@ -412,13 +816,8 @@ if ($post_action === 'delete_transaction') {
     try {
         $borrow_id = postPositiveInt('borrow_id', 'Transaction ID');
         $pdo->beginTransaction();
-        $stmtItems = $pdo->prepare('DELETE FROM borrow_items WHERE borrow_id = :borrow_id');
-        $stmtItems->execute([':borrow_id' => $borrow_id]);
-        $stmtTransaction = $pdo->prepare('DELETE FROM borrow_transactions WHERE borrow_id = :borrow_id');
-        $stmtTransaction->execute([':borrow_id' => $borrow_id]);
-        if ($stmtTransaction->rowCount() === 0) {
-            throw new RuntimeException('The selected borrowing transaction no longer exists.');
-        }
+        $stmt = $pdo->prepare('CALL sp_delete_transaction(:borrow_id)');
+        $stmt->execute([':borrow_id' => $borrow_id]);
         $pdo->commit();
         redirectWithFlash('Borrowing transaction and its equipment items deleted successfully.');
     } catch (Exception $e) {
@@ -440,7 +839,7 @@ if ($request_method === 'POST') {
             $equipment_name = postText('equipment_name', 'Equipment name', 100);
             $category = postOptionalText('category', 'Category', 50);
             $quantity_available = postNonNegativeInt('quantity_available', 'Available quantity');
-            $stmt = $pdo->prepare('INSERT INTO equipment (property_no, equipment_name, category, quantity_available) VALUES (:property_no, :equipment_name, :category, :quantity_available)');
+            $stmt = $pdo->prepare('CALL sp_insert_equipment(:property_no, :equipment_name, :category, :quantity_available)');
             $stmt->execute([
                 ':property_no'        => $property_no,
                 ':equipment_name'     => $equipment_name,
@@ -461,21 +860,14 @@ if ($request_method === 'POST') {
             $equipment_name = postText('equipment_name', 'Equipment name', 100);
             $category = postOptionalText('category', 'Category', 50);
             $quantity_available = postNonNegativeInt('quantity_available', 'Available quantity');
-            $stmt = $pdo->prepare('UPDATE equipment SET property_no = :property_no, equipment_name = :equipment_name, category = :category, quantity_available = :quantity_available WHERE equipment_id = :equipment_id');
+            $stmt = $pdo->prepare('CALL sp_update_equipment(:equipment_id, :property_no, :equipment_name, :category, :quantity_available)');
             $stmt->execute([
+                ':equipment_id'       => $equipment_id,
                 ':property_no'        => $property_no,
                 ':equipment_name'     => $equipment_name,
                 ':category'           => $category,
                 ':quantity_available' => $quantity_available,
-                ':equipment_id'       => $equipment_id
             ]);
-            if ($stmt->rowCount() === 0) {
-                $stmtExists = $pdo->prepare('SELECT 1 FROM equipment WHERE equipment_id = :equipment_id');
-                $stmtExists->execute([':equipment_id' => $equipment_id]);
-                if (!$stmtExists->fetchColumn()) {
-                    throw new RuntimeException('The selected equipment no longer exists.');
-                }
-            }
             redirectWithFlash('Equipment updated successfully!');
         } catch (Exception $e) {
             redirectWithFlash('Error updating equipment: ' . friendlyError($e), 'error');
@@ -486,11 +878,8 @@ if ($request_method === 'POST') {
     if ($action === 'delete_equipment') {
         try {
             $equipment_id = postPositiveInt('equipment_id', 'Equipment ID');
-            $stmt = $pdo->prepare('DELETE FROM equipment WHERE equipment_id = :equipment_id');
+            $stmt = $pdo->prepare('CALL sp_delete_equipment(:equipment_id)');
             $stmt->execute([':equipment_id' => $equipment_id]);
-            if ($stmt->rowCount() === 0) {
-                throw new RuntimeException('The selected equipment no longer exists.');
-            }
             redirectWithFlash('Equipment deleted successfully!');
         } catch (Exception $e) {
             redirectWithFlash('Error deleting equipment: ' . friendlyError($e), 'error');
@@ -507,19 +896,13 @@ if ($post_action === 'update_borrower') {
         $borrower_type = postBorrowerType();
         $email = postOptionalEmail();
 
-        $stmtCheck = $pdo->prepare('SELECT 1 FROM borrowers WHERE borrower_id = :borrower_id');
-        $stmtCheck->execute([':borrower_id' => $borrower_id]);
-        if (!$stmtCheck->fetchColumn()) {
-            throw new RuntimeException('The selected borrower no longer exists.');
-        }
-
-        $stmtB = $pdo->prepare('UPDATE borrowers SET borrower_no = :borrower_no, full_name = :full_name, borrower_type = :borrower_type, email = :email WHERE borrower_id = :borrower_id');
+        $stmtB = $pdo->prepare('CALL sp_update_borrower(:borrower_id, :borrower_no, :full_name, :borrower_type, :email)');
         $stmtB->execute([
+            ':borrower_id'   => $borrower_id,
             ':borrower_no'   => $borrower_no,
             ':full_name'     => $full_name,
             ':borrower_type' => $borrower_type,
             ':email'         => $email,
-            ':borrower_id'   => $borrower_id
         ]);
 
         redirectWithFlash('Borrower updated successfully.');
@@ -531,32 +914,264 @@ if ($post_action === 'update_borrower') {
 // DELETE BORROWER
 if ($post_action === 'delete') {
     try {
-        $pdo->beginTransaction();
         $borrower_id = postPositiveInt('borrower_id', 'Borrower ID');
-        
-        $stmtT = $pdo->prepare('SELECT borrow_id FROM borrow_transactions WHERE borrower_id = :id');
-        $stmtT->execute([':id' => $borrower_id]);
-        $transactions = $stmtT->fetchAll(PDO::FETCH_COLUMN);
-
-        foreach ($transactions as $bid) {
-            $pdo->prepare('DELETE FROM borrow_items WHERE borrow_id = :bid')->execute([':bid' => $bid]);
-            $pdo->prepare('DELETE FROM borrow_transactions WHERE borrow_id = :bid')->execute([':bid' => $bid]);
-        }
-        
-        $stmtBorrower = $pdo->prepare('DELETE FROM borrowers WHERE borrower_id = :id');
-        $stmtBorrower->execute([':id' => $borrower_id]);
-        if ($stmtBorrower->rowCount() === 0) {
-            throw new RuntimeException('The selected borrower no longer exists.');
-        }
-        
-        $pdo->commit();
+        $stmt = $pdo->prepare('CALL sp_delete_borrower(:borrower_id)');
+        $stmt->execute([':borrower_id' => $borrower_id]);
         redirectWithFlash('Borrower deleted successfully!');
     } catch (Exception $e) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
         redirectWithFlash('Error deleting borrower: ' . friendlyError($e), 'error');
     }
+}
+
+// Stored procedures for CRUD actions with PHP integration (Rubric Criteria 3)
+try {
+    $pdo->exec("
+        DROP PROCEDURE IF EXISTS sp_insert_borrower(VARCHAR, VARCHAR, VARCHAR, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_update_borrower(INT, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_delete_borrower(INT);
+        DROP PROCEDURE IF EXISTS sp_insert_equipment(VARCHAR, VARCHAR, VARCHAR, INT);
+        DROP PROCEDURE IF EXISTS sp_update_equipment(INT, VARCHAR, VARCHAR, VARCHAR, INT);
+        DROP PROCEDURE IF EXISTS sp_delete_equipment(INT);
+        DROP PROCEDURE IF EXISTS sp_insert_transaction(INT, DATE, DATE, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_insert_transaction(INT, DATE, DATE, VARCHAR, INT);
+        DROP PROCEDURE IF EXISTS sp_update_transaction(INT, INT, DATE, DATE, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_delete_transaction(INT);
+        DROP PROCEDURE IF EXISTS sp_insert_borrow_item(INT, INT, INT);
+        DROP PROCEDURE IF EXISTS sp_update_borrow_item(INT, INT, INT, INT);
+        DROP PROCEDURE IF EXISTS sp_delete_borrow_item(INT, INT);
+
+        CREATE OR REPLACE PROCEDURE sp_insert_borrower(
+            p_borrower_no VARCHAR(20),
+            p_full_name VARCHAR(100),
+            p_borrower_type VARCHAR(20),
+            p_email VARCHAR(120)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            INSERT INTO borrowers (borrower_no, full_name, borrower_type, email)
+            VALUES (UPPER(TRIM(p_borrower_no)), TRIM(p_full_name), LOWER(TRIM(p_borrower_type)), p_email);
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_borrower(
+            p_borrower_id INT,
+            p_borrower_no VARCHAR(20),
+            p_full_name VARCHAR(100),
+            p_borrower_type VARCHAR(20),
+            p_email VARCHAR(120)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrowers WHERE borrower_id = p_borrower_id) THEN
+                RAISE EXCEPTION 'The selected borrower no longer exists.';
+            END IF;
+
+            UPDATE borrowers
+            SET borrower_no = UPPER(TRIM(p_borrower_no)),
+                full_name = TRIM(p_full_name),
+                borrower_type = LOWER(TRIM(p_borrower_type)),
+                email = p_email
+            WHERE borrower_id = p_borrower_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_borrower(p_borrower_id INT)
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrowers WHERE borrower_id = p_borrower_id) THEN
+                RAISE EXCEPTION 'The selected borrower no longer exists.';
+            END IF;
+
+            DELETE FROM borrow_items
+            WHERE borrow_id IN (SELECT borrow_id FROM borrow_transactions WHERE borrower_id = p_borrower_id);
+
+            DELETE FROM borrow_transactions
+            WHERE borrower_id = p_borrower_id;
+
+            DELETE FROM borrowers
+            WHERE borrower_id = p_borrower_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_insert_equipment(
+            p_property_no VARCHAR(20),
+            p_equipment_name VARCHAR(100),
+            p_category VARCHAR(50),
+            p_quantity_available INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            INSERT INTO equipment (property_no, equipment_name, category, quantity_available)
+            VALUES (UPPER(TRIM(p_property_no)), TRIM(p_equipment_name), p_category, p_quantity_available);
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_equipment(
+            p_equipment_id INT,
+            p_property_no VARCHAR(20),
+            p_equipment_name VARCHAR(100),
+            p_category VARCHAR(50),
+            p_quantity_available INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM equipment WHERE equipment_id = p_equipment_id) THEN
+                RAISE EXCEPTION 'The selected equipment no longer exists.';
+            END IF;
+
+            UPDATE equipment
+            SET property_no = UPPER(TRIM(p_property_no)),
+                equipment_name = TRIM(p_equipment_name),
+                category = p_category,
+                quantity_available = p_quantity_available
+            WHERE equipment_id = p_equipment_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_equipment(p_equipment_id INT)
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM equipment WHERE equipment_id = p_equipment_id) THEN
+                RAISE EXCEPTION 'The selected equipment no longer exists.';
+            END IF;
+
+            DELETE FROM equipment
+            WHERE equipment_id = p_equipment_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_insert_transaction(
+            p_borrower_id INT,
+            p_borrow_date DATE,
+            p_due_date DATE,
+            p_status VARCHAR(20)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF p_due_date < p_borrow_date THEN
+                RAISE EXCEPTION 'Due date cannot be earlier than the borrow date.';
+            END IF;
+
+            INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status)
+            VALUES (p_borrower_id, p_borrow_date, p_due_date, LOWER(TRIM(p_status)));
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_transaction(
+            p_borrow_id INT,
+            p_borrower_id INT,
+            p_borrow_date DATE,
+            p_due_date DATE,
+            p_status VARCHAR(20)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrow_transactions WHERE borrow_id = p_borrow_id) THEN
+                RAISE EXCEPTION 'The selected borrowing transaction no longer exists.';
+            END IF;
+
+            IF p_due_date < p_borrow_date THEN
+                RAISE EXCEPTION 'Due date cannot be earlier than the borrow date.';
+            END IF;
+
+            UPDATE borrow_transactions
+            SET borrower_id = p_borrower_id,
+                borrow_date = p_borrow_date,
+                due_date = p_due_date,
+                status = LOWER(TRIM(p_status))
+            WHERE borrow_id = p_borrow_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_transaction(p_borrow_id INT)
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrow_transactions WHERE borrow_id = p_borrow_id) THEN
+                RAISE EXCEPTION 'The selected borrowing transaction no longer exists.';
+            END IF;
+
+            DELETE FROM borrow_items
+            WHERE borrow_id = p_borrow_id;
+
+            DELETE FROM borrow_transactions
+            WHERE borrow_id = p_borrow_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_insert_borrow_item(
+            p_borrow_id INT,
+            p_equipment_id INT,
+            p_quantity INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            INSERT INTO borrow_items (borrow_id, equipment_id, quantity)
+            VALUES (p_borrow_id, p_equipment_id, p_quantity);
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_borrow_item(
+            p_borrow_item_id INT,
+            p_borrow_id INT,
+            p_equipment_id INT,
+            p_quantity INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM borrow_items
+                WHERE borrow_item_id = p_borrow_item_id
+                  AND borrow_id = p_borrow_id
+            ) THEN
+                RAISE EXCEPTION 'The selected transaction item no longer exists.';
+            END IF;
+
+            UPDATE borrow_items
+            SET equipment_id = p_equipment_id,
+                quantity = p_quantity
+            WHERE borrow_item_id = p_borrow_item_id
+              AND borrow_id = p_borrow_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_borrow_item(
+            p_borrow_item_id INT,
+            p_borrow_id INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM borrow_items
+                WHERE borrow_item_id = p_borrow_item_id
+                  AND borrow_id = p_borrow_id
+            ) THEN
+                RAISE EXCEPTION 'The selected transaction item no longer exists.';
+            END IF;
+
+            DELETE FROM borrow_items
+            WHERE borrow_item_id = p_borrow_item_id
+              AND borrow_id = p_borrow_id;
+        END;
+        $$;
+    ");
+} catch (Throwable $e) {
+    error_log('Borrowing system stored procedure setup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit('Borrowing system stored procedure setup failed. Check the application error log.');
 }
 
 // CREATE OR REPLACE VIEWS (Rubric Criteria)
@@ -602,8 +1217,10 @@ try {
         LEFT JOIN borrow_items bi ON e.equipment_id = bi.equipment_id
         GROUP BY e.equipment_id, e.property_no, e.equipment_name
     ");
-} catch (Exception $e) {
+} catch (Throwable $e) {
     error_log('Borrowing system view setup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit('Borrowing system database setup failed. Check the application error log.');
 }
 
 // WEEK 10 POSTGRESQL DATABASE OBJECTS (Functions, Triggers, Audit)
@@ -653,7 +1270,7 @@ try {
             IF (TG_OP = 'UPDATE' AND OLD.equipment_id = NEW.equipment_id) THEN
                 v_already_held := OLD.quantity;
             END IF;
-            IF v_status IN ('borrowed', 'overdue')
+            IF lower(v_status) IN ('borrowed', 'overdue')
                AND NEW.quantity > v_available_qty + v_already_held THEN
                 RAISE EXCEPTION 'Requested quantity (%) exceeds available stock (%)', NEW.quantity, v_available_qty + v_already_held;
             END IF;
@@ -722,19 +1339,19 @@ try {
         BEGIN
             IF (TG_OP = 'INSERT') THEN
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = NEW.borrow_id;
-                IF v_status IN ('borrowed', 'overdue') THEN
+                IF lower(v_status) IN ('borrowed', 'overdue') THEN
                     UPDATE equipment SET quantity_available = quantity_available - NEW.quantity WHERE equipment_id = NEW.equipment_id;
                 END IF;
             ELSIF (TG_OP = 'DELETE') THEN
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = OLD.borrow_id;
-                IF v_status IN ('borrowed', 'overdue') THEN
+                IF lower(v_status) IN ('borrowed', 'overdue') THEN
                     UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
                 END IF;
             ELSIF (TG_OP = 'UPDATE') THEN
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = OLD.borrow_id;
-                v_old_active := v_status IN ('borrowed', 'overdue');
+                v_old_active := lower(v_status) IN ('borrowed', 'overdue');
                 SELECT status INTO v_status FROM borrow_transactions WHERE borrow_id = NEW.borrow_id;
-                v_new_active := v_status IN ('borrowed', 'overdue');
+                v_new_active := lower(v_status) IN ('borrowed', 'overdue');
                 IF v_old_active THEN
                     UPDATE equipment SET quantity_available = quantity_available + OLD.quantity WHERE equipment_id = OLD.equipment_id;
                 END IF;
@@ -756,8 +1373,8 @@ try {
         DECLARE
             v_item RECORD;
         BEGIN
-            IF OLD.status IN ('borrowed', 'overdue')
-               AND NEW.status NOT IN ('borrowed', 'overdue') THEN
+            IF lower(OLD.status) IN ('borrowed', 'overdue')
+               AND lower(NEW.status) NOT IN ('borrowed', 'overdue') THEN
                 FOR v_item IN
                     SELECT equipment_id, SUM(quantity)::INT AS quantity
                     FROM borrow_items
@@ -769,8 +1386,8 @@ try {
                     SET quantity_available = quantity_available + v_item.quantity
                     WHERE equipment_id = v_item.equipment_id;
                 END LOOP;
-            ELSIF OLD.status NOT IN ('borrowed', 'overdue')
-                  AND NEW.status IN ('borrowed', 'overdue') THEN
+            ELSIF lower(OLD.status) NOT IN ('borrowed', 'overdue')
+                  AND lower(NEW.status) IN ('borrowed', 'overdue') THEN
                 FOR v_item IN
                     SELECT equipment_id, SUM(quantity)::INT AS quantity
                     FROM borrow_items
@@ -797,19 +1414,40 @@ try {
         FOR EACH ROW
         WHEN (OLD.status IS DISTINCT FROM NEW.status)
         EXECUTE FUNCTION fn_sync_equipment_stock_on_status_change();
+
+        CREATE INDEX IF NOT EXISTS borrow_items_equipment_id_idx
+            ON borrow_items (equipment_id);
+        CREATE INDEX IF NOT EXISTS borrow_transactions_borrower_id_idx
+            ON borrow_transactions (borrower_id);
+        CREATE INDEX IF NOT EXISTS borrow_transactions_status_lower_idx
+            ON borrow_transactions (lower(status));
+        CREATE INDEX IF NOT EXISTS borrow_transactions_recent_idx
+            ON borrow_transactions (borrow_date DESC, borrow_id DESC);
     ");
-} catch (Exception $e) {
+} catch (Throwable $e) {
     error_log('Borrowing system database object setup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit('Borrowing system database setup failed. Check the application error log.');
 }
 
 // FETCH EQUIPMENT FOR DROPDOWN & TABLE
-$equipment_list = $pdo->query('SELECT equipment_id, property_no, equipment_name, category, quantity_available FROM equipment ORDER BY equipment_name')->fetchAll(PDO::FETCH_ASSOC);
-$borrower_list = $pdo->query('SELECT borrower_id, borrower_no, full_name, borrower_type, email FROM borrowers ORDER BY borrower_no')->fetchAll(PDO::FETCH_ASSOC);
+$equipment_list = $pdo->query("
+    SELECT equipment_id, property_no, equipment_name, category, quantity_available,
+           CASE
+               WHEN quantity_available > 5 THEN 'Available'
+               WHEN quantity_available BETWEEN 1 AND 5 THEN 'Low Stock'
+               ELSE 'Out of Stock'
+           END AS availability_status
+    FROM equipment
+    ORDER BY equipment_name
+")->fetchAll(PDO::FETCH_ASSOC);
+$borrower_list = $pdo->query('SELECT borrower_id, borrower_no, UPPER(TRIM(full_name)) AS full_name, borrower_type, email FROM borrowers ORDER BY borrower_no')->fetchAll(PDO::FETCH_ASSOC);
 $transactions = $pdo->query("
     SELECT bt.borrow_id, bt.borrower_id, b.borrower_no, b.full_name, bt.borrow_date, bt.due_date, bt.status
     FROM borrow_transactions bt
     JOIN borrowers b ON b.borrower_id = bt.borrower_id
     ORDER BY bt.borrow_date DESC, bt.borrow_id DESC
+    LIMIT 50
 ")->fetchAll(PDO::FETCH_ASSOC);
 foreach ($transactions as &$transaction) {
     $transaction['items'] = [];
@@ -819,6 +1457,12 @@ $transaction_items = $pdo->query("
     SELECT bi.borrow_item_id, bi.borrow_id, bi.equipment_id, e.equipment_name, bi.quantity
     FROM borrow_items bi
     JOIN equipment e ON e.equipment_id = bi.equipment_id
+    WHERE bi.borrow_id IN (
+        SELECT borrow_id
+        FROM borrow_transactions
+        ORDER BY borrow_date DESC, borrow_id DESC
+        LIMIT 50
+    )
     ORDER BY bi.borrow_id, bi.borrow_item_id
 ")->fetchAll(PDO::FETCH_ASSOC);
 $transactions_by_id = [];
@@ -854,15 +1498,20 @@ $monthly_report = $pdo->query("
         EXTRACT(YEAR FROM DATE_TRUNC('month', bt.borrow_date))::int AS yr,
         TO_CHAR(DATE_TRUNC('month', bt.borrow_date), 'Mon YYYY') AS month_label,
         COUNT(*) AS total_borrows,
-        COUNT(*) FILTER (WHERE bt.status = 'returned') AS returned_count,
-        COUNT(*) FILTER (WHERE bt.status IN ('borrowed', 'overdue')) AS active_count
+        COUNT(*) FILTER (WHERE lower(bt.status) = 'returned') AS returned_count,
+        COUNT(*) FILTER (WHERE lower(bt.status) IN ('borrowed', 'overdue')) AS active_count
     FROM borrow_transactions bt
     GROUP BY DATE_TRUNC('month', bt.borrow_date)
     ORDER BY DATE_TRUNC('month', bt.borrow_date) DESC
 ")->fetchAll(PDO::FETCH_ASSOC);
 
 // Reuse the created views inside the application (Rubric Criteria: Views + multiple INNER JOINs)
-$vw_details = $pdo->query("SELECT borrower_no, full_name, equipment_name, quantity, borrow_date, due_date, status FROM vw_borrowing_details ORDER BY borrow_date DESC, full_name")->fetchAll(PDO::FETCH_ASSOC);
+$vw_details = $pdo->query("
+    SELECT borrower_no, full_name, equipment_name, quantity, borrow_date, due_date, status
+    FROM vw_borrowing_details
+    ORDER BY borrow_date DESC, full_name
+    LIMIT 100
+")->fetchAll(PDO::FETCH_ASSOC);
 $vw_usage   = $pdo->query("SELECT property_no, equipment_name, total_transactions, total_quantity_borrowed, availability_status FROM vw_equipment_usage ORDER BY equipment_name")->fetchAll(PDO::FETCH_ASSOC);
 
 // Exercise the CASE classifications at stock boundaries and transaction-status edge cases.
@@ -906,7 +1555,7 @@ $case_classification_tests = $pdo->query("
 $status_summary = $pdo->query("
     SELECT statuses.status, COUNT(bt.borrow_id) AS total
     FROM (VALUES ('borrowed'), ('returned'), ('overdue')) AS statuses(status)
-    LEFT JOIN borrow_transactions bt ON bt.status = statuses.status
+    LEFT JOIN borrow_transactions bt ON lower(bt.status) = statuses.status
     GROUP BY statuses.status
     ORDER BY CASE statuses.status
         WHEN 'borrowed' THEN 1
@@ -957,12 +1606,12 @@ $equip_aggregates = $pdo->query("
 $activity_union_all = $pdo->query("
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
     UNION ALL
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
-      AND (bt.status = 'overdue' OR bt.due_date < CURRENT_DATE)
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
+      AND (lower(bt.status) = 'overdue' OR bt.due_date < CURRENT_DATE)
     ORDER BY borrower_no, borrower
 ")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -970,12 +1619,12 @@ $activity_union_all = $pdo->query("
 $activity_union = $pdo->query("
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
     UNION
     SELECT DISTINCT b.borrower_no, INITCAP(b.full_name) AS borrower
     FROM borrowers b JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
-    WHERE bt.status IN ('borrowed', 'overdue')
-      AND (bt.status = 'overdue' OR bt.due_date < CURRENT_DATE)
+    WHERE lower(bt.status) IN ('borrowed', 'overdue')
+      AND (lower(bt.status) = 'overdue' OR bt.due_date < CURRENT_DATE)
     ORDER BY borrower_no, borrower
 ")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1359,8 +2008,8 @@ $query = "
         bt.due_date,
         ABS(CURRENT_DATE - bt.due_date) AS days_difference,
         CASE
-            WHEN bt.status = 'overdue'
-              OR (bt.status = 'borrowed' AND bt.due_date < CURRENT_DATE) THEN 'Overdue'
+            WHEN lower(bt.status) = 'overdue'
+              OR (lower(bt.status) = 'borrowed' AND bt.due_date < CURRENT_DATE) THEN 'Overdue'
             ELSE INITCAP(COALESCE(bt.status, 'not borrowed'))
         END AS status_check
     FROM borrowers b
@@ -1381,9 +2030,9 @@ if ($filter_type !== '') {
 }
 if ($filter_status !== '') {
     if ($filter_status === 'overdue') {
-        $conditions[] = "(bt.status = 'overdue' OR (bt.status = 'borrowed' AND bt.due_date < CURRENT_DATE))";
+        $conditions[] = "(lower(bt.status) = 'overdue' OR (lower(bt.status) = 'borrowed' AND bt.due_date < CURRENT_DATE))";
     } else {
-        $conditions[] = 'bt.status = :status';
+        $conditions[] = 'lower(bt.status) = :status';
         $params[':status'] = $filter_status;
     }
 }
@@ -1401,7 +2050,7 @@ if ($date_to) {
 }
 
 $query .= "\nWHERE " . implode("\n  AND ", $conditions);
-$query .= "\nORDER BY $sort_by $sort_dir, b.full_name ASC";
+$query .= "\nORDER BY $sort_by $sort_dir, b.full_name ASC\nLIMIT 100";
 
 $stmt = $pdo->prepare($query);
 $stmt->execute($params);
@@ -1411,22 +2060,22 @@ $records = $stmt->fetchAll(PDO::FETCH_ASSOC);
 $kpi = $pdo->query("
     SELECT
         (SELECT COUNT(*) FROM borrowers) AS total_borrowers,
-        (SELECT COUNT(*) FROM borrow_transactions WHERE status IN ('borrowed', 'overdue')) AS active_borrowings,
+        (SELECT COUNT(*) FROM borrow_transactions WHERE lower(status) IN ('borrowed', 'overdue')) AS active_borrowings,
         (SELECT COALESCE(SUM(bi.quantity), 0)
            FROM borrow_items bi
            JOIN borrow_transactions bt ON bt.borrow_id = bi.borrow_id
-          WHERE bt.status IN ('borrowed', 'overdue')) AS items_out,
+          WHERE lower(bt.status) IN ('borrowed', 'overdue')) AS items_out,
         (SELECT COUNT(*) FROM borrow_transactions
-          WHERE status IN ('borrowed', 'overdue') AND (status = 'overdue' OR due_date < CURRENT_DATE)) AS overdue
+          WHERE lower(status) IN ('borrowed', 'overdue') AND (lower(status) = 'overdue' OR due_date < CURRENT_DATE)) AS overdue
 ")->fetch(PDO::FETCH_ASSOC);
 
 $summary_records = $pdo->query("
     SELECT
         borrower_types.borrower_type,
         COUNT(DISTINCT b.borrower_id) AS borrowers,
-        COUNT(DISTINCT CASE WHEN bt.status IN ('borrowed', 'overdue') THEN bt.borrow_id END) AS borrowings,
-        COALESCE(SUM(CASE WHEN bt.status IN ('borrowed', 'overdue') THEN bi.quantity ELSE 0 END), 0) AS items,
-        COUNT(DISTINCT CASE WHEN bt.status IN ('borrowed', 'overdue') AND (bt.status = 'overdue' OR bt.due_date < CURRENT_DATE) THEN bt.borrow_id END) AS overdue
+        COUNT(DISTINCT CASE WHEN lower(bt.status) IN ('borrowed', 'overdue') THEN bt.borrow_id END) AS borrowings,
+        COALESCE(SUM(CASE WHEN lower(bt.status) IN ('borrowed', 'overdue') THEN bi.quantity ELSE 0 END), 0) AS items,
+        COUNT(DISTINCT CASE WHEN lower(bt.status) IN ('borrowed', 'overdue') AND (lower(bt.status) = 'overdue' OR bt.due_date < CURRENT_DATE) THEN bt.borrow_id END) AS overdue
     FROM (VALUES ('student'), ('faculty'), ('staff')) AS borrower_types(borrower_type)
     LEFT JOIN borrowers b ON b.borrower_type = borrower_types.borrower_type
     LEFT JOIN borrow_transactions bt ON b.borrower_id = bt.borrower_id
@@ -1577,7 +2226,7 @@ $summary_records = $pdo->query("
                 <select name="borrower_id" required>
                     <option value="">-- Select Borrower --</option>
                     <?php foreach ($borrower_list as $borrower): ?>
-                        <option value="<?= (int)$borrower['borrower_id'] ?>"><?= htmlspecialchars($borrower['borrower_no'] . ' — ' . $borrower['full_name'], ENT_QUOTES, 'UTF-8') ?></option>
+                        <option value="<?= (int)$borrower['borrower_id'] ?>"><?= htmlspecialchars($borrower['borrower_no'] . ' — ' . borrowerDisplayName($borrower['full_name']), ENT_QUOTES, 'UTF-8') ?></option>
                     <?php endforeach; ?>
                 </select>
                 </label>
@@ -1615,6 +2264,26 @@ $summary_records = $pdo->query("
         </form>
         <?php else: ?>
             <p class="report-note">Register at least one borrower and add equipment before creating a transaction.</p>
+        <?php endif; ?>
+    </div>
+
+    <div class="card">
+        <h2>Transaction Management Check</h2>
+        <p class="report-note">Create, update, and delete workflows run related header/item writes inside a database transaction, committing only after all writes succeed and rolling back on errors. The check below forces an invalid item insert after a temporary header insert, then verifies the header was rolled back. All test work is rolled back and no borrowing data is retained.</p>
+        <?php if ($transaction_rollback_test !== null): ?>
+        <table>
+            <thead><tr><th>Test Scenario</th><th>Expected Behavior</th><th>Observed Result</th><th>Result</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td>Failed multi-step borrowing transaction</td>
+                    <td><?= htmlspecialchars($transaction_rollback_test['expected'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($transaction_rollback_test['observed'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><span class="badge <?= $transaction_rollback_test['passed'] ? 'badge-ontime' : 'badge-overdue' ?>"><?= $transaction_rollback_test['passed'] ? 'PASS' : 'FAIL' ?></span></td>
+                </tr>
+            </tbody>
+        </table>
+        <?php else: ?>
+            <p class="report-note">Rollback test unavailable because no borrower and equipment records are available.</p>
         <?php endif; ?>
     </div>
     </section>
@@ -1661,13 +2330,13 @@ $summary_records = $pdo->query("
                 <tr>
                     <td><?= (int)$borrower['borrower_id'] ?></td>
                     <td><?= htmlspecialchars($borrower['borrower_no'], ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars($borrower['full_name'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars(borrowerDisplayName($borrower['full_name']), ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= htmlspecialchars(ucfirst($borrower['borrower_type']), ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= htmlspecialchars($borrower['email'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td>
                         <div class="action-group">
                             <button type="button" class="btn-edit"
-                                onclick='fillBorrowerUpdate(<?= json_encode((int)$borrower['borrower_id']) ?>, <?= json_encode($borrower['borrower_no'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['full_name'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['borrower_type'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['email'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>)'>
+                                onclick='fillBorrowerUpdate(<?= json_encode((int)$borrower['borrower_id']) ?>, <?= json_encode($borrower['borrower_no'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode(borrowerDisplayName($borrower['full_name']), JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['borrower_type'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($borrower['email'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>)'>
                                 Edit
                             </button>
                             <form method="post" class="inline-form">
@@ -1769,7 +2438,7 @@ $summary_records = $pdo->query("
     <div class="card" id="filtered-results">
         <h2>Filtered Borrower and Transaction Results</h2>
         <p class="report-note">
-            <?= count($records) ?> matching row<?= count($records) === 1 ? '' : 's' ?>.
+            Showing <?= count($records) ?> result row<?= count($records) === 1 ? '' : 's' ?> (maximum 100).
             Rows match all selected filters; overdue includes transactions marked Overdue or Borrowed past their due date.
             Results use the selected sort field and direction, with borrower name A–Z as a tie-breaker.
             Absolute days from the due date are calculated with <code>ABS()</code>; the value is a distance, while status indicates the transaction state.
@@ -1812,6 +2481,7 @@ $summary_records = $pdo->query("
 
     <div class="card" id="records">
         <h2>Borrowing Transactions</h2>
+        <p class="report-note">Showing the latest 50 transactions and their items to keep the page responsive with large datasets.</p>
         <?php if ($transactions): ?>
         <table>
             <thead>
@@ -1908,12 +2578,13 @@ $summary_records = $pdo->query("
                     <th>Name</th>
                     <th>Category</th>
                     <th>Qty Available</th>
+                    <th>Stock Status</th>
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
                 <?php if (!$equipment_list): ?>
-                    <tr><td colspan="6">No equipment has been added yet.</td></tr>
+                    <tr><td colspan="7">No equipment has been added yet.</td></tr>
                 <?php endif; ?>
                 <?php foreach ($equipment_list as $eq): ?>
                 <tr>
@@ -1922,10 +2593,11 @@ $summary_records = $pdo->query("
                     <td><?= htmlspecialchars($eq['equipment_name'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= htmlspecialchars($eq['category'] ?? '', ENT_QUOTES, 'UTF-8') ?></td>
                     <td><?= (int)$eq['quantity_available'] ?></td>
+                    <td><?= htmlspecialchars($eq['availability_status'], ENT_QUOTES, 'UTF-8') ?></td>
                     <td>
                         <div class="action-group">
                             <button type="button" class="btn-edit" 
-                                onclick="fillEquipmentUpdate('<?= (int)$eq['equipment_id'] ?>', '<?= htmlspecialchars($eq['property_no'], ENT_QUOTES) ?>', '<?= htmlspecialchars($eq['equipment_name'], ENT_QUOTES) ?>', '<?= htmlspecialchars($eq['category'] ?? '', ENT_QUOTES) ?>', '<?= (int)$eq['quantity_available'] ?>')">
+                                onclick='fillEquipmentUpdate(<?= json_encode((int)$eq['equipment_id']) ?>, <?= json_encode($eq['property_no'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($eq['equipment_name'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($eq['category'] ?? '', JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode((int)$eq['quantity_available']) ?>)'>
                                 Edit
                             </button>
                             <form method="post" class="inline-form">
@@ -1965,10 +2637,51 @@ $summary_records = $pdo->query("
     <hr id="reports">
     <h1>Reports</h1>
 
+    <?php $backupStatus = $_SESSION['database_backup_status'] ?? null; ?>
+    <div class="card" id="database-backup">
+        <h2>Database Backup</h2>
+        <p class="report-note">Creates a PostgreSQL custom-format backup with <code>pg_dump</code>. The archive is stored outside the public web directory and checked with <code>pg_restore --list</code>. Verification does not restore or change the live database.</p>
+        <div class="backup-actions">
+            <form method="post">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                <input type="hidden" name="action" value="create_database_backup">
+                <button type="submit" class="button-success">Create &amp; Verify Backup</button>
+            </form>
+            <?php if (is_array($backupStatus) && isset($backupStatus['file'])): ?>
+            <form method="post">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                <input type="hidden" name="action" value="verify_database_backup">
+                <button type="submit" class="button-muted">Verify Latest Backup Again</button>
+            </form>
+            <?php endif; ?>
+        </div>
+
+        <?php if (is_array($backupStatus) && ($backupStatus['state'] ?? '') === 'verified'): ?>
+        <div class="backup-result" role="status">
+            <strong>Backup verified</strong>
+            <dl class="backup-details">
+                <div><dt>File</dt><dd><code><?= htmlspecialchars($backupStatus['file'] ?? '', ENT_QUOTES, 'UTF-8') ?></code></dd></div>
+                <div><dt>Saved outside web root</dt><dd><code><?= htmlspecialchars($backupStatus['path'] ?? '', ENT_QUOTES, 'UTF-8') ?></code></dd></div>
+                <div><dt>Size</dt><dd><?= number_format((int)($backupStatus['size'] ?? 0)) ?> bytes</dd></div>
+                <div><dt>Archive entries</dt><dd><?= (int)($backupStatus['toc_entries'] ?? 0) ?></dd></div>
+                <div><dt>SHA-256</dt><dd><code><?= htmlspecialchars($backupStatus['sha256'] ?? '', ENT_QUOTES, 'UTF-8') ?></code></dd></div>
+                <div><dt>Verified at</dt><dd><?= htmlspecialchars($backupStatus['verified_at'] ?? '', ENT_QUOTES, 'UTF-8') ?></dd></div>
+            </dl>
+        </div>
+        <?php elseif (is_array($backupStatus) && ($backupStatus['state'] ?? '') === 'error'): ?>
+        <div class="backup-result backup-result-error" role="alert">
+            <strong>Backup check failed</strong>
+            <p><?= htmlspecialchars($backupStatus['message'] ?? 'Check the PHP error log for details.', ENT_QUOTES, 'UTF-8') ?></p>
+        </div>
+        <?php else: ?>
+        <p class="report-note">No backup has been created in this session yet.</p>
+        <?php endif; ?>
+    </div>
+
     <!-- Complete Borrowing Report: multiple INNER JOINs via view vw_borrowing_details -->
     <div class="card">
         <h2>Complete Borrowing Report</h2>
-        <p class="report-note">Source: view <code>vw_borrowing_details</code> &mdash; borrowers &rarr; transactions &rarr; items &rarr; equipment (multiple joins).</p>
+        <p class="report-note">Source: view <code>vw_borrowing_details</code> &mdash; borrowers &rarr; transactions &rarr; items &rarr; equipment (multiple joins). Showing up to the 100 newest rows.</p>
         <?php if ($vw_details): ?>
         <table>
             <thead>
@@ -2276,26 +2989,6 @@ $summary_records = $pdo->query("
         </table>
         <?php else: ?>
             <p class="report-note">Self-tests unavailable — the integration checks require a registered borrower and at least one equipment item with two or more units available.</p>
-        <?php endif; ?>
-    </div>
-
-    <div class="card">
-        <h2>Transaction Management Check</h2>
-        <p class="report-note">Create, update, and delete workflows run related header/item writes inside a database transaction, committing only after all writes succeed and rolling back on errors. The check below forces an invalid item insert after a temporary header insert, then verifies the header was rolled back. All test work is rolled back and no borrowing data is retained.</p>
-        <?php if ($transaction_rollback_test !== null): ?>
-        <table>
-            <thead><tr><th>Test Scenario</th><th>Expected Behavior</th><th>Observed Result</th><th>Result</th></tr></thead>
-            <tbody>
-                <tr>
-                    <td>Failed multi-step borrowing transaction</td>
-                    <td><?= htmlspecialchars($transaction_rollback_test['expected'], ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><?= htmlspecialchars($transaction_rollback_test['observed'], ENT_QUOTES, 'UTF-8') ?></td>
-                    <td><span class="badge <?= $transaction_rollback_test['passed'] ? 'badge-ontime' : 'badge-overdue' ?>"><?= $transaction_rollback_test['passed'] ? 'PASS' : 'FAIL' ?></span></td>
-                </tr>
-            </tbody>
-        </table>
-        <?php else: ?>
-            <p class="report-note">Rollback test unavailable because no borrower and equipment records are available.</p>
         <?php endif; ?>
     </div>
 
