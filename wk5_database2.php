@@ -418,16 +418,19 @@ if ($post_action === 'create_transaction') {
         }
 
         $pdo->beginTransaction();
-        $stmtT = $pdo->prepare('INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status) VALUES (:borrower_id, :borrow_date, :due_date, :status) RETURNING borrow_id');
+        $stmtT = $pdo->prepare('CALL sp_insert_transaction(:borrower_id, :borrow_date, :due_date, :status)');
         $stmtT->execute([
             ':borrower_id' => $borrower_id,
             ':borrow_date' => $borrow_date,
-            ':due_date'    => $due_date,
-            ':status'      => $status,
+            ':due_date' => $due_date,
+            ':status' => $status,
         ]);
-        $borrow_id = $stmtT->fetchColumn();
+        $borrow_id = (int)$pdo->query("SELECT currval(pg_get_serial_sequence('borrow_transactions', 'borrow_id'))")->fetchColumn();
+        if ($borrow_id < 1) {
+            throw new RuntimeException('The borrowing transaction was not created.');
+        }
 
-        $stmtI = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, :quantity)');
+        $stmtI = $pdo->prepare('CALL sp_insert_borrow_item(:borrow_id, :equipment_id, :quantity)');
         foreach ($items as $item) {
             $stmtI->execute([
                 ':borrow_id'    => $borrow_id,
@@ -453,7 +456,7 @@ if ($post_action === 'create_borrower') {
         $full_name = postText('full_name', 'Full name', 100);
         $borrower_type = postBorrowerType();
         $email = postOptionalEmail();
-        $stmt = $pdo->prepare('INSERT INTO borrowers (borrower_no, full_name, borrower_type, email) VALUES (:borrower_no, :full_name, :borrower_type, :email)');
+        $stmt = $pdo->prepare('CALL sp_insert_borrower(:borrower_no, :full_name, :borrower_type, :email)');
         $stmt->execute([
             ':borrower_no'   => $borrower_no,
             ':full_name'     => $full_name,
@@ -484,27 +487,20 @@ if ($post_action === 'update_transaction') {
         }
 
         $pdo->beginTransaction();
-        $stmtT = $pdo->prepare('UPDATE borrow_transactions SET borrower_id = :borrower_id, borrow_date = :borrow_date, due_date = :due_date, status = :status WHERE borrow_id = :borrow_id');
+        $stmtT = $pdo->prepare('CALL sp_update_transaction(:borrow_id, :borrower_id, :borrow_date, :due_date, :status)');
         $stmtT->execute([
+            ':borrow_id' => $borrow_id,
             ':borrower_id' => $borrower_id,
             ':borrow_date' => $borrow_date,
             ':due_date' => $due_date,
             ':status' => $status,
-            ':borrow_id' => $borrow_id,
         ]);
-        if ($stmtT->rowCount() === 0) {
-            $stmtExists = $pdo->prepare('SELECT 1 FROM borrow_transactions WHERE borrow_id = :borrow_id');
-            $stmtExists->execute([':borrow_id' => $borrow_id]);
-            if (!$stmtExists->fetchColumn()) {
-                throw new RuntimeException('The selected borrowing transaction no longer exists.');
-            }
-        }
 
         $stmtExisting = $pdo->prepare('SELECT borrow_item_id FROM borrow_items WHERE borrow_id = :borrow_id');
         $stmtExisting->execute([':borrow_id' => $borrow_id]);
         $remaining_item_ids = array_fill_keys(array_map('strval', $stmtExisting->fetchAll(PDO::FETCH_COLUMN)), true);
-        $stmtUpdateItem = $pdo->prepare('UPDATE borrow_items SET equipment_id = :equipment_id, quantity = :quantity WHERE borrow_item_id = :borrow_item_id AND borrow_id = :borrow_id');
-        $stmtInsertItem = $pdo->prepare('INSERT INTO borrow_items (borrow_id, equipment_id, quantity) VALUES (:borrow_id, :equipment_id, :quantity)');
+        $stmtUpdateItem = $pdo->prepare('CALL sp_update_borrow_item(:borrow_item_id, :borrow_id, :equipment_id, :quantity)');
+        $stmtInsertItem = $pdo->prepare('CALL sp_insert_borrow_item(:borrow_id, :equipment_id, :quantity)');
 
         foreach ($items as $idx => $item) {
             $raw_item_id = $item_ids[$idx] ?? null;
@@ -529,16 +525,16 @@ if ($post_action === 'update_transaction') {
                 throw new InvalidArgumentException('An item in this transaction was changed or removed. Reload the page and try again.');
             }
             $stmtUpdateItem->execute([
-                ':equipment_id' => $item['equipment_id'],
-                ':quantity' => $item['quantity'],
                 ':borrow_item_id' => (int)$item_id,
                 ':borrow_id' => $borrow_id,
+                ':equipment_id' => $item['equipment_id'],
+                ':quantity' => $item['quantity'],
             ]);
             unset($remaining_item_ids[$item_id]);
         }
 
         if ($remaining_item_ids) {
-            $stmtDeleteItem = $pdo->prepare('DELETE FROM borrow_items WHERE borrow_item_id = :borrow_item_id AND borrow_id = :borrow_id');
+            $stmtDeleteItem = $pdo->prepare('CALL sp_delete_borrow_item(:borrow_item_id, :borrow_id)');
             foreach (array_keys($remaining_item_ids) as $item_id) {
                 $stmtDeleteItem->execute([
                     ':borrow_item_id' => (int)$item_id,
@@ -562,13 +558,8 @@ if ($post_action === 'delete_transaction') {
     try {
         $borrow_id = postPositiveInt('borrow_id', 'Transaction ID');
         $pdo->beginTransaction();
-        $stmtItems = $pdo->prepare('DELETE FROM borrow_items WHERE borrow_id = :borrow_id');
-        $stmtItems->execute([':borrow_id' => $borrow_id]);
-        $stmtTransaction = $pdo->prepare('DELETE FROM borrow_transactions WHERE borrow_id = :borrow_id');
-        $stmtTransaction->execute([':borrow_id' => $borrow_id]);
-        if ($stmtTransaction->rowCount() === 0) {
-            throw new RuntimeException('The selected borrowing transaction no longer exists.');
-        }
+        $stmt = $pdo->prepare('CALL sp_delete_transaction(:borrow_id)');
+        $stmt->execute([':borrow_id' => $borrow_id]);
         $pdo->commit();
         redirectWithFlash('Borrowing transaction and its equipment items deleted successfully.');
     } catch (Exception $e) {
@@ -590,7 +581,7 @@ if ($request_method === 'POST') {
             $equipment_name = postText('equipment_name', 'Equipment name', 100);
             $category = postOptionalText('category', 'Category', 50);
             $quantity_available = postNonNegativeInt('quantity_available', 'Available quantity');
-            $stmt = $pdo->prepare('INSERT INTO equipment (property_no, equipment_name, category, quantity_available) VALUES (:property_no, :equipment_name, :category, :quantity_available)');
+            $stmt = $pdo->prepare('CALL sp_insert_equipment(:property_no, :equipment_name, :category, :quantity_available)');
             $stmt->execute([
                 ':property_no'        => $property_no,
                 ':equipment_name'     => $equipment_name,
@@ -611,21 +602,14 @@ if ($request_method === 'POST') {
             $equipment_name = postText('equipment_name', 'Equipment name', 100);
             $category = postOptionalText('category', 'Category', 50);
             $quantity_available = postNonNegativeInt('quantity_available', 'Available quantity');
-            $stmt = $pdo->prepare('UPDATE equipment SET property_no = :property_no, equipment_name = :equipment_name, category = :category, quantity_available = :quantity_available WHERE equipment_id = :equipment_id');
+            $stmt = $pdo->prepare('CALL sp_update_equipment(:equipment_id, :property_no, :equipment_name, :category, :quantity_available)');
             $stmt->execute([
+                ':equipment_id'       => $equipment_id,
                 ':property_no'        => $property_no,
                 ':equipment_name'     => $equipment_name,
                 ':category'           => $category,
                 ':quantity_available' => $quantity_available,
-                ':equipment_id'       => $equipment_id
             ]);
-            if ($stmt->rowCount() === 0) {
-                $stmtExists = $pdo->prepare('SELECT 1 FROM equipment WHERE equipment_id = :equipment_id');
-                $stmtExists->execute([':equipment_id' => $equipment_id]);
-                if (!$stmtExists->fetchColumn()) {
-                    throw new RuntimeException('The selected equipment no longer exists.');
-                }
-            }
             redirectWithFlash('Equipment updated successfully!');
         } catch (Exception $e) {
             redirectWithFlash('Error updating equipment: ' . friendlyError($e), 'error');
@@ -636,11 +620,8 @@ if ($request_method === 'POST') {
     if ($action === 'delete_equipment') {
         try {
             $equipment_id = postPositiveInt('equipment_id', 'Equipment ID');
-            $stmt = $pdo->prepare('DELETE FROM equipment WHERE equipment_id = :equipment_id');
+            $stmt = $pdo->prepare('CALL sp_delete_equipment(:equipment_id)');
             $stmt->execute([':equipment_id' => $equipment_id]);
-            if ($stmt->rowCount() === 0) {
-                throw new RuntimeException('The selected equipment no longer exists.');
-            }
             redirectWithFlash('Equipment deleted successfully!');
         } catch (Exception $e) {
             redirectWithFlash('Error deleting equipment: ' . friendlyError($e), 'error');
@@ -657,19 +638,13 @@ if ($post_action === 'update_borrower') {
         $borrower_type = postBorrowerType();
         $email = postOptionalEmail();
 
-        $stmtCheck = $pdo->prepare('SELECT 1 FROM borrowers WHERE borrower_id = :borrower_id');
-        $stmtCheck->execute([':borrower_id' => $borrower_id]);
-        if (!$stmtCheck->fetchColumn()) {
-            throw new RuntimeException('The selected borrower no longer exists.');
-        }
-
-        $stmtB = $pdo->prepare('UPDATE borrowers SET borrower_no = :borrower_no, full_name = :full_name, borrower_type = :borrower_type, email = :email WHERE borrower_id = :borrower_id');
+        $stmtB = $pdo->prepare('CALL sp_update_borrower(:borrower_id, :borrower_no, :full_name, :borrower_type, :email)');
         $stmtB->execute([
+            ':borrower_id'   => $borrower_id,
             ':borrower_no'   => $borrower_no,
             ':full_name'     => $full_name,
             ':borrower_type' => $borrower_type,
             ':email'         => $email,
-            ':borrower_id'   => $borrower_id
         ]);
 
         redirectWithFlash('Borrower updated successfully.');
@@ -681,32 +656,264 @@ if ($post_action === 'update_borrower') {
 // DELETE BORROWER
 if ($post_action === 'delete') {
     try {
-        $pdo->beginTransaction();
         $borrower_id = postPositiveInt('borrower_id', 'Borrower ID');
-        
-        $stmtT = $pdo->prepare('SELECT borrow_id FROM borrow_transactions WHERE borrower_id = :id');
-        $stmtT->execute([':id' => $borrower_id]);
-        $transactions = $stmtT->fetchAll(PDO::FETCH_COLUMN);
-
-        foreach ($transactions as $bid) {
-            $pdo->prepare('DELETE FROM borrow_items WHERE borrow_id = :bid')->execute([':bid' => $bid]);
-            $pdo->prepare('DELETE FROM borrow_transactions WHERE borrow_id = :bid')->execute([':bid' => $bid]);
-        }
-        
-        $stmtBorrower = $pdo->prepare('DELETE FROM borrowers WHERE borrower_id = :id');
-        $stmtBorrower->execute([':id' => $borrower_id]);
-        if ($stmtBorrower->rowCount() === 0) {
-            throw new RuntimeException('The selected borrower no longer exists.');
-        }
-        
-        $pdo->commit();
+        $stmt = $pdo->prepare('CALL sp_delete_borrower(:borrower_id)');
+        $stmt->execute([':borrower_id' => $borrower_id]);
         redirectWithFlash('Borrower deleted successfully!');
     } catch (Exception $e) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
         redirectWithFlash('Error deleting borrower: ' . friendlyError($e), 'error');
     }
+}
+
+// Stored procedures for CRUD actions with PHP integration (Rubric Criteria 3)
+try {
+    $pdo->exec("
+        DROP PROCEDURE IF EXISTS sp_insert_borrower(VARCHAR, VARCHAR, VARCHAR, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_update_borrower(INT, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_delete_borrower(INT);
+        DROP PROCEDURE IF EXISTS sp_insert_equipment(VARCHAR, VARCHAR, VARCHAR, INT);
+        DROP PROCEDURE IF EXISTS sp_update_equipment(INT, VARCHAR, VARCHAR, VARCHAR, INT);
+        DROP PROCEDURE IF EXISTS sp_delete_equipment(INT);
+        DROP PROCEDURE IF EXISTS sp_insert_transaction(INT, DATE, DATE, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_insert_transaction(INT, DATE, DATE, VARCHAR, INT);
+        DROP PROCEDURE IF EXISTS sp_update_transaction(INT, INT, DATE, DATE, VARCHAR);
+        DROP PROCEDURE IF EXISTS sp_delete_transaction(INT);
+        DROP PROCEDURE IF EXISTS sp_insert_borrow_item(INT, INT, INT);
+        DROP PROCEDURE IF EXISTS sp_update_borrow_item(INT, INT, INT, INT);
+        DROP PROCEDURE IF EXISTS sp_delete_borrow_item(INT, INT);
+
+        CREATE OR REPLACE PROCEDURE sp_insert_borrower(
+            p_borrower_no VARCHAR(20),
+            p_full_name VARCHAR(100),
+            p_borrower_type VARCHAR(20),
+            p_email VARCHAR(120)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            INSERT INTO borrowers (borrower_no, full_name, borrower_type, email)
+            VALUES (UPPER(TRIM(p_borrower_no)), TRIM(p_full_name), LOWER(TRIM(p_borrower_type)), p_email);
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_borrower(
+            p_borrower_id INT,
+            p_borrower_no VARCHAR(20),
+            p_full_name VARCHAR(100),
+            p_borrower_type VARCHAR(20),
+            p_email VARCHAR(120)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrowers WHERE borrower_id = p_borrower_id) THEN
+                RAISE EXCEPTION 'The selected borrower no longer exists.';
+            END IF;
+
+            UPDATE borrowers
+            SET borrower_no = UPPER(TRIM(p_borrower_no)),
+                full_name = TRIM(p_full_name),
+                borrower_type = LOWER(TRIM(p_borrower_type)),
+                email = p_email
+            WHERE borrower_id = p_borrower_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_borrower(p_borrower_id INT)
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrowers WHERE borrower_id = p_borrower_id) THEN
+                RAISE EXCEPTION 'The selected borrower no longer exists.';
+            END IF;
+
+            DELETE FROM borrow_items
+            WHERE borrow_id IN (SELECT borrow_id FROM borrow_transactions WHERE borrower_id = p_borrower_id);
+
+            DELETE FROM borrow_transactions
+            WHERE borrower_id = p_borrower_id;
+
+            DELETE FROM borrowers
+            WHERE borrower_id = p_borrower_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_insert_equipment(
+            p_property_no VARCHAR(20),
+            p_equipment_name VARCHAR(100),
+            p_category VARCHAR(50),
+            p_quantity_available INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            INSERT INTO equipment (property_no, equipment_name, category, quantity_available)
+            VALUES (UPPER(TRIM(p_property_no)), TRIM(p_equipment_name), p_category, p_quantity_available);
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_equipment(
+            p_equipment_id INT,
+            p_property_no VARCHAR(20),
+            p_equipment_name VARCHAR(100),
+            p_category VARCHAR(50),
+            p_quantity_available INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM equipment WHERE equipment_id = p_equipment_id) THEN
+                RAISE EXCEPTION 'The selected equipment no longer exists.';
+            END IF;
+
+            UPDATE equipment
+            SET property_no = UPPER(TRIM(p_property_no)),
+                equipment_name = TRIM(p_equipment_name),
+                category = p_category,
+                quantity_available = p_quantity_available
+            WHERE equipment_id = p_equipment_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_equipment(p_equipment_id INT)
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM equipment WHERE equipment_id = p_equipment_id) THEN
+                RAISE EXCEPTION 'The selected equipment no longer exists.';
+            END IF;
+
+            DELETE FROM equipment
+            WHERE equipment_id = p_equipment_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_insert_transaction(
+            p_borrower_id INT,
+            p_borrow_date DATE,
+            p_due_date DATE,
+            p_status VARCHAR(20)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF p_due_date < p_borrow_date THEN
+                RAISE EXCEPTION 'Due date cannot be earlier than the borrow date.';
+            END IF;
+
+            INSERT INTO borrow_transactions (borrower_id, borrow_date, due_date, status)
+            VALUES (p_borrower_id, p_borrow_date, p_due_date, LOWER(TRIM(p_status)));
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_transaction(
+            p_borrow_id INT,
+            p_borrower_id INT,
+            p_borrow_date DATE,
+            p_due_date DATE,
+            p_status VARCHAR(20)
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrow_transactions WHERE borrow_id = p_borrow_id) THEN
+                RAISE EXCEPTION 'The selected borrowing transaction no longer exists.';
+            END IF;
+
+            IF p_due_date < p_borrow_date THEN
+                RAISE EXCEPTION 'Due date cannot be earlier than the borrow date.';
+            END IF;
+
+            UPDATE borrow_transactions
+            SET borrower_id = p_borrower_id,
+                borrow_date = p_borrow_date,
+                due_date = p_due_date,
+                status = LOWER(TRIM(p_status))
+            WHERE borrow_id = p_borrow_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_transaction(p_borrow_id INT)
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM borrow_transactions WHERE borrow_id = p_borrow_id) THEN
+                RAISE EXCEPTION 'The selected borrowing transaction no longer exists.';
+            END IF;
+
+            DELETE FROM borrow_items
+            WHERE borrow_id = p_borrow_id;
+
+            DELETE FROM borrow_transactions
+            WHERE borrow_id = p_borrow_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_insert_borrow_item(
+            p_borrow_id INT,
+            p_equipment_id INT,
+            p_quantity INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            INSERT INTO borrow_items (borrow_id, equipment_id, quantity)
+            VALUES (p_borrow_id, p_equipment_id, p_quantity);
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_update_borrow_item(
+            p_borrow_item_id INT,
+            p_borrow_id INT,
+            p_equipment_id INT,
+            p_quantity INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM borrow_items
+                WHERE borrow_item_id = p_borrow_item_id
+                  AND borrow_id = p_borrow_id
+            ) THEN
+                RAISE EXCEPTION 'The selected transaction item no longer exists.';
+            END IF;
+
+            UPDATE borrow_items
+            SET equipment_id = p_equipment_id,
+                quantity = p_quantity
+            WHERE borrow_item_id = p_borrow_item_id
+              AND borrow_id = p_borrow_id;
+        END;
+        $$;
+
+        CREATE OR REPLACE PROCEDURE sp_delete_borrow_item(
+            p_borrow_item_id INT,
+            p_borrow_id INT
+        )
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM borrow_items
+                WHERE borrow_item_id = p_borrow_item_id
+                  AND borrow_id = p_borrow_id
+            ) THEN
+                RAISE EXCEPTION 'The selected transaction item no longer exists.';
+            END IF;
+
+            DELETE FROM borrow_items
+            WHERE borrow_item_id = p_borrow_item_id
+              AND borrow_id = p_borrow_id;
+        END;
+        $$;
+    ");
+} catch (Throwable $e) {
+    error_log('Borrowing system stored procedure setup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit('Borrowing system stored procedure setup failed. Check the application error log.');
 }
 
 // CREATE OR REPLACE VIEWS (Rubric Criteria)
