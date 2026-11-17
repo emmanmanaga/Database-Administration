@@ -1,18 +1,27 @@
 <?php
 session_start();
 
-$host     = 'localhost';
-$port     = '5432';
-$dbname   = 'postgres';
-$user     = 'postgres';
-$password = 'woshidaxuesheng';
+$localConfigPath = __DIR__ . DIRECTORY_SEPARATOR . 'db.local.php';
+$localDatabaseConfig = [];
+if (is_file($localConfigPath)) {
+    $loadedDatabaseConfig = require $localConfigPath;
+    if (is_array($loadedDatabaseConfig)) {
+        $localDatabaseConfig = $loadedDatabaseConfig;
+    }
+}
+
+$host     = getenv('DB_HOST') ?: (string)($localDatabaseConfig['host'] ?? 'localhost');
+$port     = getenv('DB_PORT') ?: (string)($localDatabaseConfig['port'] ?? '5432');
+$dbname   = getenv('DB_NAME') ?: (string)($localDatabaseConfig['dbname'] ?? 'postgres');
+$user     = getenv('DB_USER') ?: (string)($localDatabaseConfig['user'] ?? 'postgres');
+$password = getenv('DB_PASSWORD') ?: (string)($localDatabaseConfig['password'] ?? '');
 
 // Demonstration operator label recorded by the Week 10 audit trigger (see fn_borrow_items_audit).
 $actor = 'postgre';
 
 try {
     if ($password === '') {
-        throw new RuntimeException('The DB_PASSWORD environment variable is not configured.');
+        throw new RuntimeException('Set DB_PASSWORD or configure a local db.local.php file.');
     }
     $pdo = new PDO("pgsql:host=$host;port=$port;dbname=$dbname;connect_timeout=5", $user, $password);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -403,6 +412,255 @@ function friendlyError(Throwable $e): string {
     }
     error_log('Borrowing system operation failed: ' . $e->getMessage());
     return 'The operation could not be completed. Please review the information and try again.';
+}
+
+function databaseBackupDirectory(): string {
+    $documentRoot = realpath((string)($_SERVER['DOCUMENT_ROOT'] ?? '')) ?: realpath(__DIR__) ?: __DIR__;
+    $directory = trim((string)(getenv('WK5_BACKUP_DIR') ?: ''));
+    if ($directory === '') {
+        $directory = dirname($documentRoot) . DIRECTORY_SEPARATOR . 'wk5_database_backups';
+    }
+
+    $isAbsolute = DIRECTORY_SEPARATOR === '\\'
+        ? (preg_match('/^[A-Za-z]:[\/\\\\]/', $directory) === 1 || strpos($directory, '\\\\') === 0)
+        : strpos($directory, '/') === 0;
+    if (!$isAbsolute) {
+        throw new RuntimeException('The backup directory must be an absolute path.');
+    }
+
+    if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) {
+        throw new RuntimeException('The backup directory could not be created. Check its parent-folder permissions.');
+    }
+    $realDirectory = realpath($directory);
+    if ($realDirectory === false || !is_writable($realDirectory)) {
+        throw new RuntimeException('The backup directory is not writable by PHP.');
+    }
+
+    $normalizedRoot = rtrim(str_replace('\\', '/', $documentRoot), '/') . '/';
+    $normalizedBackup = rtrim(str_replace('\\', '/', $realDirectory), '/') . '/';
+    $insideWebRoot = DIRECTORY_SEPARATOR === '\\'
+        ? strncasecmp($normalizedBackup, $normalizedRoot, strlen($normalizedRoot)) === 0
+        : strncmp($normalizedBackup, $normalizedRoot, strlen($normalizedRoot)) === 0;
+    if ($insideWebRoot) {
+        throw new RuntimeException('Backups must be stored outside the public web directory.');
+    }
+
+    return $realDirectory;
+}
+
+function findPostgresUtility(string $utility): string {
+    $environmentKey = strtoupper(str_replace('-', '_', $utility)) . '_PATH';
+    $configuredPath = getenv($environmentKey);
+    if (is_string($configuredPath) && $configuredPath !== '' && is_file($configuredPath)) {
+        return $configuredPath;
+    }
+
+    $binaryName = $utility . (DIRECTORY_SEPARATOR === '\\' ? '.exe' : '');
+    $binDirectory = getenv('PG_BIN_DIR');
+    $candidates = [];
+    if (is_string($binDirectory) && $binDirectory !== '') {
+        $candidates[] = rtrim($binDirectory, '\\/') . DIRECTORY_SEPARATOR . $binaryName;
+    }
+    foreach (explode(PATH_SEPARATOR, (string)getenv('PATH')) as $pathEntry) {
+        if ($pathEntry !== '') {
+            $candidates[] = rtrim($pathEntry, '\\/') . DIRECTORY_SEPARATOR . $binaryName;
+        }
+    }
+
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $programFiles = getenv('ProgramFiles') ?: 'C:\\Program Files';
+        $installed = glob(
+            rtrim($programFiles, '\\/') . DIRECTORY_SEPARATOR . 'PostgreSQL' .
+            DIRECTORY_SEPARATOR . '*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $binaryName
+        ) ?: [];
+        usort($installed, static fn(string $a, string $b): int => strnatcasecmp($b, $a));
+        $candidates = array_merge($candidates, $installed);
+    }
+
+    foreach ($candidates as $candidate) {
+        if (is_file($candidate)) {
+            return $candidate;
+        }
+    }
+
+    throw new RuntimeException(
+        $utility . ' was not found. Add PostgreSQL\\bin to PATH or configure ' . $environmentKey . '.'
+    );
+}
+
+function runPostgresUtility(string $binary, array $arguments, string $password = ''): array {
+    if (!function_exists('proc_open')) {
+        throw new RuntimeException('PHP proc_open is disabled, so PostgreSQL backup utilities cannot run.');
+    }
+
+    $environment = getenv();
+    $environment = is_array($environment) ? $environment : [];
+    if ($password !== '') {
+        $environment['PGPASSWORD'] = $password;
+    }
+    $environment['PGCONNECT_TIMEOUT'] = '10';
+
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $process = @proc_open(array_merge([$binary], $arguments), $descriptors, $pipes, null, $environment);
+    if (!is_resource($process)) {
+        throw new RuntimeException('PHP could not start ' . basename($binary) . '.');
+    }
+
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+
+    return [
+        'exit_code' => $exitCode,
+        'stdout' => is_string($stdout) ? $stdout : '',
+        'stderr' => is_string($stderr) ? trim($stderr) : '',
+    ];
+}
+
+function verifyDatabaseBackupArchive(string $archivePath, string $pgRestore): int {
+    $result = runPostgresUtility($pgRestore, ['--list', $archivePath]);
+    $entries = preg_match_all('/^\d+;\s/m', $result['stdout']);
+    if ($result['exit_code'] !== 0 || $entries < 1) {
+        $detail = $result['stderr'] !== '' ? ' ' . substr($result['stderr'], 0, 400) : '';
+        throw new RuntimeException('The backup archive did not pass pg_restore verification.' . $detail);
+    }
+    return $entries;
+}
+
+function createDatabaseBackup(): array {
+    global $host, $port, $dbname, $user, $password;
+
+    $directory = databaseBackupDirectory();
+    $pgDump = findPostgresUtility('pg_dump');
+    $pgRestore = findPostgresUtility('pg_restore');
+    $temporaryPath = tempnam($directory, '.wk5-backup-');
+    if ($temporaryPath === false) {
+        throw new RuntimeException('PHP could not create a temporary backup file.');
+    }
+
+    $filename = 'wk5_database_backup_' . date('Ymd_His') . '_' . bin2hex(random_bytes(4)) . '.dump';
+    $finalPath = $directory . DIRECTORY_SEPARATOR . $filename;
+    try {
+        $result = runPostgresUtility($pgDump, [
+            '--no-password',
+            '--host', $host,
+            '--port', (string)$port,
+            '--username', $user,
+            '--dbname', $dbname,
+            '--format=custom',
+            '--no-owner',
+            '--no-privileges',
+            '--file', $temporaryPath,
+        ], $password);
+        if ($result['exit_code'] !== 0 || !is_file($temporaryPath) || filesize($temporaryPath) < 1) {
+            $detail = $result['stderr'] !== '' ? ' ' . substr($result['stderr'], 0, 400) : '';
+            throw new RuntimeException('pg_dump could not create the database archive.' . $detail);
+        }
+
+        $entryCount = verifyDatabaseBackupArchive($temporaryPath, $pgRestore);
+        if (!@rename($temporaryPath, $finalPath)) {
+            throw new RuntimeException('The verified backup could not be moved into the backup folder.');
+        }
+        $temporaryPath = '';
+        @chmod($finalPath, 0600);
+
+        $fileSize = filesize($finalPath);
+        $sha256 = hash_file('sha256', $finalPath);
+        if ($fileSize === false || $sha256 === false) {
+            throw new RuntimeException('The backup was created, but its verification details could not be read.');
+        }
+
+        return [
+            'state' => 'verified',
+            'file' => $filename,
+            'path' => $finalPath,
+            'size' => $fileSize,
+            'sha256' => $sha256,
+            'toc_entries' => $entryCount,
+            'verified_at' => date(DATE_ATOM),
+        ];
+    } finally {
+        if ($temporaryPath !== '' && is_file($temporaryPath)) {
+            @unlink($temporaryPath);
+        }
+    }
+}
+
+function verifyLatestDatabaseBackup(array $backupStatus): array {
+    $filename = $backupStatus['file'] ?? '';
+    if (!is_string($filename) || !preg_match('/^wk5_database_backup_[0-9]{8}_[0-9]{6}_[a-f0-9]{8}\.dump$/D', $filename)) {
+        throw new RuntimeException('There is no valid backup file available to verify.');
+    }
+
+    $directory = databaseBackupDirectory();
+    $archivePath = $directory . DIRECTORY_SEPARATOR . $filename;
+    if (!is_file($archivePath)) {
+        throw new RuntimeException('The latest backup file is missing from the backup folder.');
+    }
+
+    $pgRestore = findPostgresUtility('pg_restore');
+    $entryCount = verifyDatabaseBackupArchive($archivePath, $pgRestore);
+    $fileSize = filesize($archivePath);
+    $sha256 = hash_file('sha256', $archivePath);
+    if ($fileSize === false || $sha256 === false) {
+        throw new RuntimeException('The backup exists, but its verification details could not be read.');
+    }
+    $expectedHash = $backupStatus['sha256'] ?? '';
+    if (is_string($expectedHash) && $expectedHash !== '' && !hash_equals($expectedHash, $sha256)) {
+        throw new RuntimeException('The backup checksum changed since it was created.');
+    }
+
+    $backupStatus['state'] = 'verified';
+    $backupStatus['path'] = $archivePath;
+    $backupStatus['size'] = $fileSize;
+    $backupStatus['sha256'] = $sha256;
+    $backupStatus['toc_entries'] = $entryCount;
+    $backupStatus['verified_at'] = date(DATE_ATOM);
+    return $backupStatus;
+}
+
+if ($post_action === 'create_database_backup') {
+    try {
+        set_time_limit(0);
+        $backupStatus = createDatabaseBackup();
+        $_SESSION['database_backup_status'] = $backupStatus;
+        redirectWithFlash('Database backup created and verified successfully.');
+    } catch (Throwable $e) {
+        error_log('Database backup failed: ' . $e->getMessage());
+        $_SESSION['database_backup_status'] = [
+            'state' => 'error',
+            'message' => $e->getMessage(),
+            'failed_at' => date(DATE_ATOM),
+        ];
+        redirectWithFlash('Database backup failed: ' . $e->getMessage(), 'error');
+    }
+}
+
+if ($post_action === 'verify_database_backup') {
+    try {
+        set_time_limit(0);
+        $backupStatus = $_SESSION['database_backup_status'] ?? [];
+        if (!is_array($backupStatus)) {
+            $backupStatus = [];
+        }
+        $_SESSION['database_backup_status'] = verifyLatestDatabaseBackup($backupStatus);
+        redirectWithFlash('The latest backup passed pg_restore archive verification.');
+    } catch (Throwable $e) {
+        error_log('Database backup verification failed: ' . $e->getMessage());
+        $_SESSION['database_backup_status'] = [
+            'state' => 'error',
+            'message' => $e->getMessage(),
+            'failed_at' => date(DATE_ATOM),
+        ];
+        redirectWithFlash('Backup verification failed: ' . $e->getMessage(), 'error');
+    }
 }
 
 // CREATE TRANSACTION WITH ONE OR MORE BORROW ITEMS
@@ -1156,6 +1414,15 @@ try {
         FOR EACH ROW
         WHEN (OLD.status IS DISTINCT FROM NEW.status)
         EXECUTE FUNCTION fn_sync_equipment_stock_on_status_change();
+
+        CREATE INDEX IF NOT EXISTS borrow_items_equipment_id_idx
+            ON borrow_items (equipment_id);
+        CREATE INDEX IF NOT EXISTS borrow_transactions_borrower_id_idx
+            ON borrow_transactions (borrower_id);
+        CREATE INDEX IF NOT EXISTS borrow_transactions_status_lower_idx
+            ON borrow_transactions (lower(status));
+        CREATE INDEX IF NOT EXISTS borrow_transactions_recent_idx
+            ON borrow_transactions (borrow_date DESC, borrow_id DESC);
     ");
 } catch (Throwable $e) {
     error_log('Borrowing system database object setup failed: ' . $e->getMessage());
@@ -1180,6 +1447,7 @@ $transactions = $pdo->query("
     FROM borrow_transactions bt
     JOIN borrowers b ON b.borrower_id = bt.borrower_id
     ORDER BY bt.borrow_date DESC, bt.borrow_id DESC
+    LIMIT 50
 ")->fetchAll(PDO::FETCH_ASSOC);
 foreach ($transactions as &$transaction) {
     $transaction['items'] = [];
@@ -1189,6 +1457,12 @@ $transaction_items = $pdo->query("
     SELECT bi.borrow_item_id, bi.borrow_id, bi.equipment_id, e.equipment_name, bi.quantity
     FROM borrow_items bi
     JOIN equipment e ON e.equipment_id = bi.equipment_id
+    WHERE bi.borrow_id IN (
+        SELECT borrow_id
+        FROM borrow_transactions
+        ORDER BY borrow_date DESC, borrow_id DESC
+        LIMIT 50
+    )
     ORDER BY bi.borrow_id, bi.borrow_item_id
 ")->fetchAll(PDO::FETCH_ASSOC);
 $transactions_by_id = [];
@@ -1232,7 +1506,12 @@ $monthly_report = $pdo->query("
 ")->fetchAll(PDO::FETCH_ASSOC);
 
 // Reuse the created views inside the application (Rubric Criteria: Views + multiple INNER JOINs)
-$vw_details = $pdo->query("SELECT borrower_no, full_name, equipment_name, quantity, borrow_date, due_date, status FROM vw_borrowing_details ORDER BY borrow_date DESC, full_name")->fetchAll(PDO::FETCH_ASSOC);
+$vw_details = $pdo->query("
+    SELECT borrower_no, full_name, equipment_name, quantity, borrow_date, due_date, status
+    FROM vw_borrowing_details
+    ORDER BY borrow_date DESC, full_name
+    LIMIT 100
+")->fetchAll(PDO::FETCH_ASSOC);
 $vw_usage   = $pdo->query("SELECT property_no, equipment_name, total_transactions, total_quantity_borrowed, availability_status FROM vw_equipment_usage ORDER BY equipment_name")->fetchAll(PDO::FETCH_ASSOC);
 
 // Exercise the CASE classifications at stock boundaries and transaction-status edge cases.
@@ -1771,7 +2050,7 @@ if ($date_to) {
 }
 
 $query .= "\nWHERE " . implode("\n  AND ", $conditions);
-$query .= "\nORDER BY $sort_by $sort_dir, b.full_name ASC";
+$query .= "\nORDER BY $sort_by $sort_dir, b.full_name ASC\nLIMIT 100";
 
 $stmt = $pdo->prepare($query);
 $stmt->execute($params);
@@ -2159,7 +2438,7 @@ $summary_records = $pdo->query("
     <div class="card" id="filtered-results">
         <h2>Filtered Borrower and Transaction Results</h2>
         <p class="report-note">
-            <?= count($records) ?> matching row<?= count($records) === 1 ? '' : 's' ?>.
+            Showing <?= count($records) ?> result row<?= count($records) === 1 ? '' : 's' ?> (maximum 100).
             Rows match all selected filters; overdue includes transactions marked Overdue or Borrowed past their due date.
             Results use the selected sort field and direction, with borrower name A–Z as a tie-breaker.
             Absolute days from the due date are calculated with <code>ABS()</code>; the value is a distance, while status indicates the transaction state.
@@ -2202,6 +2481,7 @@ $summary_records = $pdo->query("
 
     <div class="card" id="records">
         <h2>Borrowing Transactions</h2>
+        <p class="report-note">Showing the latest 50 transactions and their items to keep the page responsive with large datasets.</p>
         <?php if ($transactions): ?>
         <table>
             <thead>
@@ -2317,7 +2597,7 @@ $summary_records = $pdo->query("
                     <td>
                         <div class="action-group">
                             <button type="button" class="btn-edit" 
-                                onclick="fillEquipmentUpdate('<?= (int)$eq['equipment_id'] ?>', '<?= htmlspecialchars($eq['property_no'], ENT_QUOTES) ?>', '<?= htmlspecialchars($eq['equipment_name'], ENT_QUOTES) ?>', '<?= htmlspecialchars($eq['category'] ?? '', ENT_QUOTES) ?>', '<?= (int)$eq['quantity_available'] ?>')">
+                                onclick='fillEquipmentUpdate(<?= json_encode((int)$eq['equipment_id']) ?>, <?= json_encode($eq['property_no'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($eq['equipment_name'], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode($eq['category'] ?? '', JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>, <?= json_encode((int)$eq['quantity_available']) ?>)'>
                                 Edit
                             </button>
                             <form method="post" class="inline-form">
@@ -2357,10 +2637,51 @@ $summary_records = $pdo->query("
     <hr id="reports">
     <h1>Reports</h1>
 
+    <?php $backupStatus = $_SESSION['database_backup_status'] ?? null; ?>
+    <div class="card" id="database-backup">
+        <h2>Database Backup</h2>
+        <p class="report-note">Creates a PostgreSQL custom-format backup with <code>pg_dump</code>. The archive is stored outside the public web directory and checked with <code>pg_restore --list</code>. Verification does not restore or change the live database.</p>
+        <div class="backup-actions">
+            <form method="post">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                <input type="hidden" name="action" value="create_database_backup">
+                <button type="submit" class="button-success">Create &amp; Verify Backup</button>
+            </form>
+            <?php if (is_array($backupStatus) && isset($backupStatus['file'])): ?>
+            <form method="post">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                <input type="hidden" name="action" value="verify_database_backup">
+                <button type="submit" class="button-muted">Verify Latest Backup Again</button>
+            </form>
+            <?php endif; ?>
+        </div>
+
+        <?php if (is_array($backupStatus) && ($backupStatus['state'] ?? '') === 'verified'): ?>
+        <div class="backup-result" role="status">
+            <strong>Backup verified</strong>
+            <dl class="backup-details">
+                <div><dt>File</dt><dd><code><?= htmlspecialchars($backupStatus['file'] ?? '', ENT_QUOTES, 'UTF-8') ?></code></dd></div>
+                <div><dt>Saved outside web root</dt><dd><code><?= htmlspecialchars($backupStatus['path'] ?? '', ENT_QUOTES, 'UTF-8') ?></code></dd></div>
+                <div><dt>Size</dt><dd><?= number_format((int)($backupStatus['size'] ?? 0)) ?> bytes</dd></div>
+                <div><dt>Archive entries</dt><dd><?= (int)($backupStatus['toc_entries'] ?? 0) ?></dd></div>
+                <div><dt>SHA-256</dt><dd><code><?= htmlspecialchars($backupStatus['sha256'] ?? '', ENT_QUOTES, 'UTF-8') ?></code></dd></div>
+                <div><dt>Verified at</dt><dd><?= htmlspecialchars($backupStatus['verified_at'] ?? '', ENT_QUOTES, 'UTF-8') ?></dd></div>
+            </dl>
+        </div>
+        <?php elseif (is_array($backupStatus) && ($backupStatus['state'] ?? '') === 'error'): ?>
+        <div class="backup-result backup-result-error" role="alert">
+            <strong>Backup check failed</strong>
+            <p><?= htmlspecialchars($backupStatus['message'] ?? 'Check the PHP error log for details.', ENT_QUOTES, 'UTF-8') ?></p>
+        </div>
+        <?php else: ?>
+        <p class="report-note">No backup has been created in this session yet.</p>
+        <?php endif; ?>
+    </div>
+
     <!-- Complete Borrowing Report: multiple INNER JOINs via view vw_borrowing_details -->
     <div class="card">
         <h2>Complete Borrowing Report</h2>
-        <p class="report-note">Source: view <code>vw_borrowing_details</code> &mdash; borrowers &rarr; transactions &rarr; items &rarr; equipment (multiple joins).</p>
+        <p class="report-note">Source: view <code>vw_borrowing_details</code> &mdash; borrowers &rarr; transactions &rarr; items &rarr; equipment (multiple joins). Showing up to the 100 newest rows.</p>
         <?php if ($vw_details): ?>
         <table>
             <thead>
