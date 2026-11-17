@@ -5,5 +5,5 @@ return [
     'port' => getenv('DB_PORT') ?: '5432',
     'dbname' => getenv('DB_NAME') ?: 'postgres',
     'user' => getenv('DB_USER') ?: 'postgres',
-    'password' => getenv('DB_PASSWORD') ?: '',
+    'password' => getenv('DB_PASSWORD') ?: 'woshidaxuesheng',
 ];

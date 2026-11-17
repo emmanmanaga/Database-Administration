@@ -555,6 +555,9 @@ function createDatabaseBackup(): array {
             '--username', $user,
             '--dbname', $dbname,
             '--format=custom',
+            '--section=pre-data',
+            '--section=data',
+            '--section=post-data',
             '--no-owner',
             '--no-privileges',
             '--file', $temporaryPath,
@@ -2640,7 +2643,7 @@ $summary_records = $pdo->query("
     <?php $backupStatus = $_SESSION['database_backup_status'] ?? null; ?>
     <div class="card" id="database-backup">
         <h2>Database Backup</h2>
-        <p class="report-note">Creates a PostgreSQL custom-format backup with <code>pg_dump</code>. The archive is stored outside the public web directory and checked with <code>pg_restore --list</code>. Verification does not restore or change the live database.</p>
+        <p class="report-note">Creates a PostgreSQL custom-format backup containing the schema, table data, and post-data objects with <code>pg_dump</code>. The archive is stored outside the public web directory and checked with <code>pg_restore --list</code>. Verification does not restore or change the live database.</p>
         <div class="backup-actions">
             <form method="post">
                 <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
