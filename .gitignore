@@ -1,0 +1,5 @@
+/db.local.php
+**/db.local.php
+*.dump
+/wk5_database_backups/
+**/wk5_database_backups/
